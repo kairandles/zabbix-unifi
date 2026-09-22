@@ -24,6 +24,7 @@ See [CHANGELOG.md](CHANGELOG.md) for what's changed between versions.
 - [Alarms Reference](#alarms-reference)
 - [Site Discovery Filtering](#site-discovery-filtering)
 - [WAN Alarm Suppression](#wan-alarm-suppression)
+- [Site Outage Alarm Suppression](#site-outage-alarm-suppression)
 - [High Availability (Shadow Mode)](#high-availability-shadow-mode)
 - [Troubleshooting](#troubleshooting)
 
@@ -216,7 +217,7 @@ The template authenticates to the UniFi Site Manager API using an API key.
 
 ### 2. Prepare Local Controller Credentials
 
-Local polling hits each console's UniFi OS controller directly over HTTPS (port 443). A local admin account with **View Only** permissions is sufficient and recommended.
+Local polling hits each console's UniFi OS controller directly over HTTPS. That is port 443 on a UniFi OS console (UDM, CloudKey, UX); self-hosted UniFi OS Server uses 11443 instead, which you set with `{$UNIFI.LOCAL.PORT}`. A local admin account with **View Only** permissions is sufficient and recommended.
 
 **To create a local read-only account:**
 
@@ -348,6 +349,7 @@ Common optional overrides:
 | `{$UNIFI.LOCAL.POLL.INTERVAL}` | `10s` | Default per-device local poll interval, propagated to every discovered console and then on to every device - override at any tier (root, console, or device). Not a secret, so unlike username/password the real default lives directly on this template rather than requiring a root host override. Safe to poll this fast since no login is attached to this item (see [Polling Architecture](#polling-architecture)) - only the session-token refresh (`{$UNIFI.SESSION.REFRESH.INTERVAL}`, default 10m) actually logs in |
 | `{$UNIFI.CONSOLE.POLL.INTERVAL}` | `3m` | Default interval for each console's own combined local poll (`Local Raw (Combined)`, a `CALCULATED` item), propagated to every discovered console - override at the root or per-console. Safe to set much lower (e.g. `10s`) for fast WAN/health telemetry - this item doesn't log in itself, so its speed has no effect on login frequency (see [Polling Architecture](#polling-architecture)) |
 | `{$UNIFI.SESSION.REFRESH.INTERVAL}` | `10m` | Default interval for each console's session-token mint + cloud device fetch (`Local Session + Cloud Devices Raw`), propagated to every discovered console - override at the root or per-console. Deliberately conservative rather than cut close to the ~2 hour session token lifetime: the login is cheap either way, but UniFi's local rate limiter is only confirmed to trigger on concurrent logins, not proven safe against a sustained per-minute rate too, so this keeps total login attempts low regardless |
+| `{$UNIFI.LOCAL.PORT}` | `443` | Local controller HTTPS port, propagated to every discovered console and then on to every device. `443` on UniFi OS consoles (UDM, CloudKey, UX); set this to `11443` for self-hosted UniFi OS Server. Override at any tier if a fleet is mixed |
 | `{$WAN_UPTIME_WARN}` | `99` | Site-wide combined WAN uptime AVERAGE threshold (%) |
 | `{$WAN_UPTIME_HIGH}` | `95` | Site-wide combined WAN uptime DISASTER threshold (%) |
 | `{$UNIFI.SITE.EXCLUDE}` | *(empty)* | Comma-separated consoles to exclude from discovery, see [Site Discovery Filtering](#site-discovery-filtering) |
@@ -358,6 +360,7 @@ Common optional overrides:
 |-------|---------|-------------|
 | `{$APIKEY}` | *(secret)* | Inherited or overridden API key |
 | `{$UNIFI.LOCAL.IP}` | *(auto)* | Console management IP - set by discovery |
+| `{$UNIFI.LOCAL.PORT}` | `443` | Local controller HTTPS port - inherited from the root host at discovery time, or overridden here. Use `11443` for self-hosted UniFi OS Server |
 | `{$UNIFI.USERNAME}` | *(auto)* | Local controller read-only username - inherited from the root host at discovery time, or overridden here |
 | `{$UNIFI.PASSWORD}` | *(auto)* | Local controller password - inherited from the root host at discovery time, or overridden here |
 | `{$UNIFI.API.AUTH.URI}` | `api/auth/login` | Login endpoint |
@@ -373,6 +376,7 @@ Common optional overrides:
 | `{$WAN_UPTIME_WARN}` | `99` | Per-WAN 24h availability AVERAGE threshold (%), about 14 min/day |
 | `{$WAN_UPTIME_HIGH}` | `98` | Per-WAN 24h availability HIGH threshold (0% fires a separate alarm) |
 | `{$UNIFI.WAN.LATENCY.WARN}` | `100` | WAN latency warning threshold (ms) |
+| `{$UNIFI.CONSOLE.OFFLINE.GRACE}` | `3m` | How long the console must be continuously cloud-disconnected before "Console lost cloud connectivity" fires - sized to ride out a WAN failover between two uplinks without alarming. Must be longer than the 1m Connection State poll interval |
 | `{$UNIFI.WAN.ENABLED}` | `1` | Master WAN alarm switch (1=enabled, 0=suppressed for all WANs) |
 | `{$UNIFI.WAN.ENABLED:WAN2}` | `1` | WAN2-specific alarm switch, set to 0 to suppress all WAN2 alarms |
 | `{$UNIFI.CPU.USAGE.WARN}` | `80` | CPU usage warning threshold (%) |
@@ -437,7 +441,7 @@ Severities follow standard Zabbix conventions: INFO < WARNING < AVERAGE < HIGH <
 
 | Alarm | Severity | Fires when |
 |-------|----------|-----------|
-| Console lost cloud connectivity | DISASTER | Console state is not `connected` via cloud API |
+| Console lost cloud connectivity | DISASTER | Console state has not been `connected` at any point in the last `{$UNIFI.CONSOLE.OFFLINE.GRACE}` (default 3m), so a brief WAN failover doesn't alarm; recovers on the first `connected` sample |
 | Host is blocked by Ubiquiti | HIGH | Console account is suspended or blocked |
 | Unadopted UniFi OS devices found | WARNING | One or more UniFiOS devices are pending adoption |
 | No backup within expected interval | AVERAGE | Last backup older than `{$BACKUP_INTERVAL}` |
@@ -519,7 +523,7 @@ Two sets of WAN items are discovered per gateway:
 
 | Alarm | Severity | Fires when |
 |-------|----------|-----------|
-| Site has no gateway device | DISASTER | Gateway device count = 0, all routing is down |
+| Site has no gateway device | DISASTER | Gateway device count = 0 for two consecutive samples while the console is cloud-connected, all routing is down |
 | Site aggregate WAN uptime critical | DISASTER | Combined WAN uptime < `{$WAN_UPTIME_HIGH}`% |
 | Site has critical notification(s) in UniFi | AVERAGE | UniFi is reporting one or more critical notifications |
 | Site aggregate WAN uptime degraded | AVERAGE | Combined WAN uptime < `{$WAN_UPTIME_WARN}`% |
@@ -530,6 +534,8 @@ Two sets of WAN items are discovered per gateway:
 | Site has multiple offline WiFi devices | HIGH | More than one AP offline simultaneously |
 | Site has multiple offline wired devices | HIGH | More than one wired device offline simultaneously |
 | Site has offline gateway device(s) | HIGH | One or more gateways are offline |
+
+All seven offline-count alarms require the condition on two consecutive samples (~2-3 minutes with the count items' 2m heartbeat) and are suppressed while the console itself is not cloud-connected - during a site WAN outage or failover these cloud-derived counts describe lost visibility, not real device state. The fast path for "something just died" is the per-device offline alarm (~1 minute); these are the slower site-level rollups (see [Site Outage Alarm Suppression](#site-outage-alarm-suppression)).
 | IPS/IDS disabled or not configured | WARNING | Threat management is not active on this site |
 | Site has device(s) with firmware updates | INFO | One or more devices have firmware updates queued |
 
@@ -566,7 +572,7 @@ The following alarms come from the **Ubiquiti UniFi UAP** template (local contro
 | Alarm | Severity | Fires when |
 |-------|----------|-----------|
 | Offline - not seen by local controller | HIGH | Device state ≠ 1 (alarms and clears on a single poll, no persistence window) |
-| Device offline (cloud) | HIGH | Cloud API reports status = offline |
+| Device offline (cloud) | HIGH | Cloud API reports the device offline while its console still reads online in the same payload - a real single-device failure, not a site-wide outage. Fires on the first offline sample, ~1 minute (see [Site Outage Alarm Suppression](#site-outage-alarm-suppression)) |
 | CPU usage critical | HIGH | CPU > `{$UNIFI.CPU.USAGE.HIGH}`% |
 | Memory usage critical | HIGH | Memory > `{$UNIFI.MEM.USAGE.HIGH}`% |
 | Radio not running | HIGH | Radio state is not RUN |
@@ -586,7 +592,7 @@ The following alarms come from the **Ubiquiti UniFi USW** template (local contro
 | Alarm | Severity | Fires when |
 |-------|----------|-----------|
 | Offline - not seen by local controller | HIGH | Device state ≠ 1 (alarms and clears on a single poll, no persistence window) |
-| Device offline (cloud) | HIGH | Cloud API reports status = offline |
+| Device offline (cloud) | HIGH | Cloud API reports the device offline while its console still reads online in the same payload - a real single-device failure, not a site-wide outage. Fires on the first offline sample, ~1 minute (see [Site Outage Alarm Suppression](#site-outage-alarm-suppression)) |
 | CPU usage critical | HIGH | CPU > `{$UNIFI.CPU.USAGE.HIGH}`% |
 | Memory usage critical | HIGH | Memory > `{$UNIFI.MEM.USAGE.HIGH}`% |
 | SFP TX fault active | HIGH | Module reports a transmit laser fault, likely a failed SFP or broken TX fibre |
@@ -626,7 +632,7 @@ The following alarms come from the **Ubiquiti UniFi UPS** template (local contro
 | Alarm | Severity | Fires when |
 |-------|----------|-----------|
 | Offline - not seen by local controller | HIGH | Device state ≠ 1 (alarms and clears on a single poll, no persistence window) |
-| Device offline (cloud) | HIGH | Cloud API reports status = offline |
+| Device offline (cloud) | HIGH | Cloud API reports the device offline while its console still reads online in the same payload - a real single-device failure, not a site-wide outage. Fires on the first offline sample, ~1 minute (see [Site Outage Alarm Suppression](#site-outage-alarm-suppression)) |
 | Battery level critical | HIGH | Battery < `{$UNIFI.UPS.BATTERY.HIGH}`% |
 | Battery runtime critical | HIGH | Remaining runtime < `{$UNIFI.UPS.RUNTIME.HIGH}` seconds |
 | Running on battery, mains power failed | HIGH | UPS is in battery mode |
@@ -650,7 +656,7 @@ The following alarms come from the **Ubiquiti UniFi RPS** template (local contro
 | RPS delivering 54V, connected device PSU failed | DISASTER | RPS is actively supplying 54V (PoE) to a device |
 | RPS port ACTIVE, primary PSU failed on connected device | DISASTER | RPS port has taken over from a failed PSU |
 | Offline - not seen by local controller | HIGH | Device state ≠ 1 (alarms and clears on a single poll, no persistence window) |
-| Device offline (cloud) | HIGH | Cloud API reports status = offline |
+| Device offline (cloud) | HIGH | Cloud API reports the device offline while its console still reads online in the same payload - a real single-device failure, not a site-wide outage. Fires on the first offline sample, ~1 minute (see [Site Outage Alarm Suppression](#site-outage-alarm-suppression)) |
 | Temperature critical | HIGH | Temp > `{$UNIFI.TEMP.HIGH}`°C |
 | Temperature high | WARNING | Temp > `{$UNIFI.TEMP.WARN}`°C |
 | RPS port disconnected, redundancy lost | WARNING | Port is not connected; device has no redundant power path |
@@ -733,6 +739,21 @@ For gateways where a WAN port is intentionally unused, set a host-level context 
 3. Add the macro name and value, then click **Update**
 
 Changes take effect on the next trigger evaluation (within one poll cycle).
+
+---
+
+## Site Outage Alarm Suppression
+
+When a site loses its WAN (or fails over between two WANs), the console disconnects from the Ubiquiti cloud and the cloud API marks **every device at that site** `offline` - not because the devices went down, but because nothing can report on them any more. Without suppression this fans out into one HIGH alert per AP and switch, followed minutes later by the actual WAN/tunnel alert, and then a matching flood of recovery emails when the WAN comes back.
+
+The templates treat "the cloud lost sight of the site" and "a device actually died" as different conditions:
+
+- **Per-device "is offline" (cloud)** fires on a dedicated `Offline State` item whose preprocessing reads both the device's status *and* its console's status from the *same* `/v1/devices` payload (the console lists itself there with `isConsole: true`), and resolves them to one value: `0` = online, `1` = device offline while the console still reads online (a genuine single-device failure - alarm), `2` = device offline but the console is offline too (the cloud can't see the site at all, so per-device statuses are meaningless - stay silent). Because the distinction is made atomically inside one item from one payload, there is no cross-item or cross-host polling race and **no confirmation delay: a genuine failure alerts on the first offline sample (~1 minute)**, while a site outage or WAN failover - however brief - resolves to `2` and never alarms. A problem that was already open when the site went dark is held open rather than flap-closed (the trigger recovers only on state `0`), and a device that stays offline after the site comes back alerts within a poll cycle.
+- **Site-level offline counts** (offline devices / WiFi / wired / gateway, no-gateway) live on the console host itself, so they gate directly on the console's `Connection State` item, plus a two-consecutive-samples requirement (~2-3 minutes with the count items' 2m heartbeat) that closes the sub-minute race between the counts and the state item, which come from different master items on independent poll schedules. These are aggregate rollups - the per-device alarm above is the fast path.
+- **"Console lost cloud connectivity"** (DISASTER) only fires after the console has been disconnected for the whole of `{$UNIFI.CONSOLE.OFFLINE.GRACE}` (default `3m`), so a 1-2 minute WAN failover doesn't alarm at all. It recovers on the first `connected` sample.
+- **Local-controller polling** (per-device state, Protect cameras) needs no gating: when the site is unreachable the poll itself fails, the items go unsupported, and the triggers simply hold their last state.
+
+The net result for a sustained site outage is two meaningful alerts - the console DISASTER (after the grace period) plus whatever WAN/SD-WAN monitoring you have - instead of one per device. For a brief WAN failover, nothing fires.
 
 ---
 

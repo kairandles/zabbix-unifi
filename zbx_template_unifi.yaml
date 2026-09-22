@@ -29,7 +29,7 @@ zabbix_export:
 
       Template available at https://github.com/kairandles/zabbix-unifi
 
-      Version: 1.5.0
+      Version: 1.6.0
     groups:
     - name: Templates
     items:
@@ -96,6 +96,9 @@ zabbix_export:
         - macro: '{$SITENAME}'
           value: '{#SITENAME}'
           description: Site name derived from hostname - used for host group assignment
+        - macro: '{$UNIFI.LOCAL.PORT}'
+          value: '{#LOCALPORT}'
+          description: Local controller HTTPS port, inherited from the root host's default at discovery time
         - macro: '{$UNIFI.LOCAL.IP}'
           value: '{#LOCALIP}'
           description: Local management IP of this console (e.g. 10.183.200.1)
@@ -136,6 +139,8 @@ zabbix_export:
         path: $..reportedState.hostname.first()
       - lld_macro: '{#LOCALIP}'
         path: $.localIp
+      - lld_macro: '{#LOCALPORT}'
+        path: $.localPort
       - lld_macro: '{#APIKEY}'
         path: $.apikey
       - lld_macro: '{#SITENAME}'
@@ -223,6 +228,7 @@ zabbix_export:
               obj[i].consolePollInterval = '{$UNIFI.CONSOLE.POLL.INTERVAL}';
               obj[i].sessionRefreshInterval = '{$UNIFI.SESSION.REFRESH.INTERVAL}';
               obj[i].localApiEnabled = '{$UNIFI.LOCAL.API.ENABLED}';
+              obj[i].localPort = '{$UNIFI.LOCAL.PORT}';
               delete obj[i].reportedState.controllers;
               delete obj[i].features;
               delete obj[i].userData;
@@ -307,6 +313,11 @@ zabbix_export:
       value: '150'
       description: 'Latency threshold in ms for WARNING alert. Raise to 200+ for Central America sites where 60-80ms to UK
         is normal (default: 150)'
+    - macro: '{$UNIFI.LOCAL.PORT}'
+      value: '443'
+      description: 'Local controller HTTPS port, copied to every discovered console and device at discovery time.
+        443 on UniFi OS consoles (UDM, CloudKey, UX); set this to 11443 for self-hosted UniFi OS Server. Override
+        per console on that console''s own host if a fleet is mixed.'
     - macro: '{$UNIFI.SITE.EXCLUDE}'
       value: ''
       description: 'Comma-separated list of consoles to exclude from discovery. Workaround for the UniFi API not enforcing
@@ -322,7 +333,7 @@ zabbix_export:
 
       Template available at https://github.com/kairandles/zabbix-unifi
 
-      Version: 1.5.0
+      Version: 1.6.0
     groups:
     - name: Templates
     items:
@@ -639,12 +650,16 @@ zabbix_export:
         value: Unifi Gateway
       triggers:
       - uuid: 7da30f54173e492eb6c067227cbacd7f
-        expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")<>1
+        expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,{$UNIFI.CONSOLE.OFFLINE.GRACE},"regexp","connected")<>1
+        recovery_mode: RECOVERY_EXPRESSION
+        recovery_expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")=1
         name: 'Console lost cloud connectivity - state: {ITEM.LASTVALUE}'
         priority: DISASTER
         description: This UniFi console is no longer connected to the Ubiquiti cloud. Local network operations continue,
-          but cloud management, remote access, and SD-WAN signalling may be affected. Check the console WAN and the 
-          site-level internet triggers. If the site WAN is up, check the console directly.
+          but cloud management, remote access, and SD-WAN signalling may be affected. Check the console WAN and the
+          site-level internet triggers. If the site WAN is up, check the console directly. Fires only once the console
+          has been disconnected for the whole of {$UNIFI.CONSOLE.OFFLINE.GRACE} (default 3m), so a brief WAN failover
+          between two uplinks does not alarm; recovers on the first connected sample.
     - uuid: 9908bbc6f93c4e02b2680170147ecc5a
       name: Device State
       type: DEPENDENT
@@ -778,6 +793,64 @@ zabbix_export:
       tags:
       - tag: component
         value: raw
+    - uuid: 06cb8934f8cc4cc28feb0d5c5209e3d8
+      name: 'Device Discovery Source'
+      type: CALCULATED
+      key: unifi.discover.devices.src
+      delay: '{$UNIFI.SESSION.REFRESH.INTERVAL}'
+      history: 1h
+      value_type: TEXT
+      trends: '0'
+      params: last(//unifi.api.host.devices)
+      description: 'Master item for the five Network device discovery rules. Carries the cloud device inventory (from
+        "Unifi API Raw: Host Devices", so discovery still works on a console with no local path) with a freshly minted
+        local session token attached, which the host prototypes hand to each device as {$UNIFI.SESSION.TOKEN}. The
+        token is best-effort: if the local login fails the device list is still returned with an empty token, so
+        discovery never blocks on local access. Refreshed on {$UNIFI.SESSION.REFRESH.INTERVAL} (default 10m), well
+        inside the ~2 hour token lifetime, and costs exactly one login per console per refresh.'
+      preprocessing:
+      - type: JAVASCRIPT
+        parameters:
+        - |
+          var cloud;
+          try {
+              cloud = JSON.parse(value);
+          } catch (e) {
+              throw 'cloud device list unavailable: ' + e;
+          }
+
+          // The token is deliberately best-effort. A console with no local path from
+          // this Zabbix server must still discover its devices (they are monitored
+          // cloud-side regardless), so a failed login yields an empty token rather
+          // than failing the item and stalling discovery.
+          var token = '';
+          if ('{$UNIFI.LOCAL.API.ENABLED}' !== '0') {
+              try {
+                  var req = new HttpRequest();
+                  req.addHeader('Content-Type: application/json');
+                  req.post('https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.AUTH.URI}',
+                      JSON.stringify({username: '{$UNIFI.USERNAME}', password: '{$UNIFI.PASSWORD}'}));
+                  if (req.getStatus() === 200) {
+                      var headers = req.getHeaders();
+                      for (var h in headers) {
+                          if (h.toLowerCase() === 'set-cookie') {
+                              var m = String(headers[h]).match(/{$UNIFI.API.AUTH.TOKEN}=([^;]+);/);
+                              if (m) { token = m[1]; }
+                              break;
+                          }
+                      }
+                  } else {
+                      Zabbix.log(4, '[UniFi discovery] local login HTTP ' + req.getStatus() + ' - discovering devices without a local token');
+                  }
+              } catch (e) {
+                  Zabbix.log(4, '[UniFi discovery] local login failed (' + e + ') - discovering devices without a local token');
+              }
+          }
+          cloud.token = token;
+          return JSON.stringify(cloud);
+      tags:
+      - tag: component
+        value: raw
     - uuid: 122dd6a2e28a4f22b897feb716fe026d
       name: 'Local Session + Cloud Devices Raw'
       type: HTTP_AGENT
@@ -786,7 +859,7 @@ zabbix_export:
       history: 1h
       value_type: TEXT
       trends: '0'
-      url: https://{$UNIFI.LOCAL.IP}/{$UNIFI.API.AUTH.URI}
+      url: https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.AUTH.URI}
       post_type: JSON
       posts: '{"username":"{$UNIFI.USERNAME}","password":"{$UNIFI.PASSWORD}"}'
       request_method: POST
@@ -853,7 +926,7 @@ zabbix_export:
               if ('{$UNIFI.LOCAL.API.ENABLED}' === '0') {
                   throw 'local API disabled for this console ({$UNIFI.LOCAL.API.ENABLED}=0) - skipping local network calls';
               }
-              var base = 'https://{$UNIFI.LOCAL.IP}';
+              var base = 'https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}';
               var token = null;
 
               try {
@@ -1600,7 +1673,7 @@ zabbix_export:
         parameters:
         - |
           try {
-              var base = 'https://{$UNIFI.LOCAL.IP}';
+              var base = 'https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}';
               var token = null;
 
               try {
@@ -2249,7 +2322,8 @@ zabbix_export:
           manual_close: 'YES'
           dependencies:
           - name: 'Console lost cloud connectivity - state: {ITEM.LASTVALUE}'
-            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")<>1
+            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,{$UNIFI.CONSOLE.OFFLINE.GRACE},"regexp","connected")<>1
+            recovery_expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")=1
           description: Gateway switch port {#PORTID} ({#PORTNAME}) has gone down after previously being
             up. Check the cable and connected device. Resolves if the port comes back up, or automatically
             after 24 hours. Can be manually closed for intentionally unused ports.
@@ -2425,7 +2499,8 @@ zabbix_export:
           manual_close: 'YES'
           dependencies:
           - name: 'Console lost cloud connectivity - state: {ITEM.LASTVALUE}'
-            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")<>1
+            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,{$UNIFI.CONSOLE.OFFLINE.GRACE},"regexp","connected")<>1
+            recovery_expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")=1
           description: More than {$UNIFI.PORT.DROPPED.WARN} received packets have been dropped on gateway port
             {#PORTID} ({#PORTNAME}) within the last {$UNIFI.PORT.DROPPED.WINDOW}. A low, steady trickle of RX drops
             is normal on a real link (congestion, buffer limits) - this only fires on a genuinely elevated rate, not
@@ -2458,7 +2533,8 @@ zabbix_export:
           manual_close: 'YES'
           dependencies:
           - name: 'Console lost cloud connectivity - state: {ITEM.LASTVALUE}'
-            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")<>1
+            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,{$UNIFI.CONSOLE.OFFLINE.GRACE},"regexp","connected")<>1
+            recovery_expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")=1
           description: More than {$UNIFI.PORT.DROPPED.WARN} transmit packets have been dropped on gateway port
             {#PORTID} ({#PORTNAME}) within the last {$UNIFI.PORT.DROPPED.WINDOW}. A low, steady trickle of TX drops
             is normal on a real link (congestion, buffer limits) - this only fires on a genuinely elevated rate, not
@@ -2492,7 +2568,8 @@ zabbix_export:
           manual_close: 'YES'
           dependencies:
           - name: 'Console lost cloud connectivity - state: {ITEM.LASTVALUE}'
-            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")<>1
+            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,{$UNIFI.CONSOLE.OFFLINE.GRACE},"regexp","connected")<>1
+            recovery_expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")=1
           description: Spanning Tree is actively blocking this port to prevent a network loop. If unexpected, check
             for an accidental cable loop or a misconfigured redundant link near this port.
       - uuid: 2f4688620bdc4c97a69e8709f4f95abe
@@ -2634,7 +2711,8 @@ zabbix_export:
           manual_close: 'YES'
           dependencies:
           - name: 'Console lost cloud connectivity - state: {ITEM.LASTVALUE}'
-            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")<>1
+            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,{$UNIFI.CONSOLE.OFFLINE.GRACE},"regexp","connected")<>1
+            recovery_expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")=1
           description: Transmit errors are actively increasing on gateway port {#PORTID} ({#PORTNAME}).
             Typically a physical layer issue - faulty cable, duplex mismatch, or failing NIC. Replace
             the cable first. Error count resets on device reboot.
@@ -2666,7 +2744,8 @@ zabbix_export:
           manual_close: 'YES'
           dependencies:
           - name: 'Console lost cloud connectivity - state: {ITEM.LASTVALUE}'
-            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")<>1
+            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,{$UNIFI.CONSOLE.OFFLINE.GRACE},"regexp","connected")<>1
+            recovery_expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")=1
           description: Receive errors are actively increasing on gateway port {#PORTID} ({#PORTNAME}).
             Common causes include damaged cable, failing SFP, or faulty NIC. Error count resets on
             device reboot.
@@ -2764,7 +2843,8 @@ zabbix_export:
           manual_close: 'YES'
           dependencies:
           - name: 'Console lost cloud connectivity - state: {ITEM.LASTVALUE}'
-            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")<>1
+            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,{$UNIFI.CONSOLE.OFFLINE.GRACE},"regexp","connected")<>1
+            recovery_expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")=1
           description: The SFP module on gateway port {#PORTID} ({#PORTNAME}) is reporting a transmit fault. This
             typically indicates a failed or failing laser, a faulty module, or a broken fibre on the TX strand. The
             link will likely be down. Replace the module and check the fibre patch lead.
@@ -2797,7 +2877,8 @@ zabbix_export:
           manual_close: 'YES'
           dependencies:
           - name: 'Console lost cloud connectivity - state: {ITEM.LASTVALUE}'
-            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")<>1
+            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,{$UNIFI.CONSOLE.OFFLINE.GRACE},"regexp","connected")<>1
+            recovery_expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")=1
           description: The SFP module on gateway port {#PORTID} ({#PORTNAME}) is not detecting a receive signal.
             Check the fibre patch lead, connector cleanliness, and the remote transmitter.
       - uuid: 9e7fb636aa9b40dc83c88a5242cbbd65
@@ -2967,7 +3048,8 @@ zabbix_export:
           priority: HIGH
           dependencies:
           - name: 'Console lost cloud connectivity - state: {ITEM.LASTVALUE}'
-            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")<>1
+            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,{$UNIFI.CONSOLE.OFFLINE.GRACE},"regexp","connected")<>1
+            recovery_expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")=1
           description: The SFP module on gateway port {#PORTID} ({#PORTNAME}) has exceeded the critical temperature
             threshold ({$UNIFI.SFP.TEMP.HIGH}°C).
         - uuid: 7c294b789b9140f88fd3af46d46089f7
@@ -2978,7 +3060,8 @@ zabbix_export:
           priority: WARNING
           dependencies:
           - name: 'Console lost cloud connectivity - state: {ITEM.LASTVALUE}'
-            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")<>1
+            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,{$UNIFI.CONSOLE.OFFLINE.GRACE},"regexp","connected")<>1
+            recovery_expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")=1
           description: The SFP module on gateway port {#PORTID} ({#PORTNAME}) is above the warning temperature
             threshold ({$UNIFI.SFP.TEMP.WARN}°C).
       - uuid: 861acca3aa504068b95a7ee102ca303e
@@ -3011,7 +3094,8 @@ zabbix_export:
           manual_close: 'YES'
           dependencies:
           - name: 'Console lost cloud connectivity - state: {ITEM.LASTVALUE}'
-            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")<>1
+            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,{$UNIFI.CONSOLE.OFFLINE.GRACE},"regexp","connected")<>1
+            recovery_expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")=1
           description: Received optical power on gateway port {#PORTID} ({#PORTNAME}) is critically low
             ({$UNIFI.SFP.RXPOWER.LOW.HIGH} dBm threshold).
         - uuid: a6d44cc315294afbac1bcc902db28185
@@ -3023,7 +3107,8 @@ zabbix_export:
           manual_close: 'YES'
           dependencies:
           - name: 'Console lost cloud connectivity - state: {ITEM.LASTVALUE}'
-            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")<>1
+            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,{$UNIFI.CONSOLE.OFFLINE.GRACE},"regexp","connected")<>1
+            recovery_expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")=1
           description: Received optical power on gateway port {#PORTID} ({#PORTNAME}) is below the warning threshold
             ({$UNIFI.SFP.RXPOWER.LOW.WARN} dBm).
       - uuid: 37acf6115b4142fcad2a1626ffda0f2c
@@ -3056,7 +3141,8 @@ zabbix_export:
           manual_close: 'YES'
           dependencies:
           - name: 'Console lost cloud connectivity - state: {ITEM.LASTVALUE}'
-            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")<>1
+            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,{$UNIFI.CONSOLE.OFFLINE.GRACE},"regexp","connected")<>1
+            recovery_expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")=1
           description: Transmit laser power on gateway port {#PORTID} ({#PORTNAME}) is critically low
             ({$UNIFI.SFP.TXPOWER.LOW.HIGH} dBm threshold).
         - uuid: ee7ea0fd02eb427896fefd6af7157d8b
@@ -3068,7 +3154,8 @@ zabbix_export:
           manual_close: 'YES'
           dependencies:
           - name: 'Console lost cloud connectivity - state: {ITEM.LASTVALUE}'
-            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")<>1
+            expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,{$UNIFI.CONSOLE.OFFLINE.GRACE},"regexp","connected")<>1
+            recovery_expression: find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")=1
           description: Transmit laser output on gateway port {#PORTID} ({#PORTNAME}) is below the warning threshold
             ({$UNIFI.SFP.TXPOWER.LOW.WARN} dBm).
       - uuid: 2df75f3ac526421793dfeb180873c4af
@@ -3193,7 +3280,7 @@ zabbix_export:
           error_handler_params: '0'
         - type: DISCARD_UNCHANGED_HEARTBEAT
           parameters:
-          - 10m
+          - 2m
         master_item:
           key: unifi.api.host.sites
         tags:
@@ -3201,17 +3288,30 @@ zabbix_export:
           value: site
         trigger_prototypes:
         - uuid: bcd5ed1402844c47a8f2a0aa8cede050
-          expression: last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineDevice[{#SITEID}])=1
+          expression: last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineDevice[{#SITEID}])=1 and
+            last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineDevice[{#SITEID}],#2)=1 and
+            find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")=1
+          recovery_mode: RECOVERY_EXPRESSION
+          recovery_expression: last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineDevice[{#SITEID}])<>1
           name: Site has 1 offline device
           priority: AVERAGE
           description: One device at this site has gone offline according to the UniFi controller site statistics. Check
-            the UniFi dashboard to identify the specific device and verify its power and uplink connectivity.
+            the UniFi dashboard to identify the specific device and verify its power and uplink connectivity. Requires
+            two consecutive samples and is suppressed while the console is not cloud-connected - these counts are
+            cloud-derived, so during a site WAN outage or failover they describe lost visibility, not real device state.
         - uuid: e003b14993e84fbba59edc84e800fcb4
-          expression: last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineDevice[{#SITEID}])>1
+          expression: last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineDevice[{#SITEID}])>1 and
+            last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineDevice[{#SITEID}],#2)>1 and
+            find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")=1
+          recovery_mode: RECOVERY_EXPRESSION
+          recovery_expression: last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineDevice[{#SITEID}])<=1
           name: Site has {ITEM.LASTVALUE} offline devices
           priority: HIGH
           description: Multiple devices at this site are offline simultaneously. This often indicates a shared switch or
             power failure. Check upstream switches and power distribution first, then investigate individual devices.
+            Requires two consecutive samples and is suppressed while the console is not cloud-connected - these counts
+            are cloud-derived, so during a site WAN outage or failover they describe lost visibility, not real device
+            state.
       - uuid: 5682e4d3b3c84496a85923e118316a57
         name: Offline Gateway Devices
         type: DEPENDENT
@@ -3226,7 +3326,7 @@ zabbix_export:
           error_handler_params: '0'
         - type: DISCARD_UNCHANGED_HEARTBEAT
           parameters:
-          - 10m
+          - 2m
         master_item:
           key: unifi.api.host.sites
         tags:
@@ -3234,12 +3334,18 @@ zabbix_export:
           value: site
         trigger_prototypes:
         - uuid: efca17d1653f44b3b376f191913fa6ec
-          expression: last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineGatewayDevice[{#SITEID}])>0
+          expression: last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineGatewayDevice[{#SITEID}])>0 and
+            last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineGatewayDevice[{#SITEID}],#2)>0 and
+            find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")=1
+          recovery_mode: RECOVERY_EXPRESSION
+          recovery_expression: last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineGatewayDevice[{#SITEID}])=0
           name: Site has {ITEM.LASTVALUE} offline gateway device(s)
           priority: HIGH
           description: One or more gateway devices at this site are showing as offline. This will impact routing and may
             affect internet and SD-WAN connectivity for the entire site. Check the gateway power, WAN link, and upstream
-            switch connectivity.
+            switch connectivity. Requires two consecutive samples and is suppressed while the console is not
+            cloud-connected - these counts are cloud-derived, so during a site WAN outage or failover they describe lost
+            visibility, not real device state.
       - uuid: 54b5d414289547d6be9c735d3a218335
         name: Offline Wifi Devices
         type: DEPENDENT
@@ -3254,7 +3360,7 @@ zabbix_export:
           error_handler_params: '0'
         - type: DISCARD_UNCHANGED_HEARTBEAT
           parameters:
-          - 10m
+          - 2m
         master_item:
           key: unifi.api.host.sites
         tags:
@@ -3262,18 +3368,31 @@ zabbix_export:
           value: site
         trigger_prototypes:
         - uuid: 480a6c7961204bda884b8aedc6befee0
-          expression: last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineWifiDevice[{#SITEID}])=1
+          expression: last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineWifiDevice[{#SITEID}])=1 and
+            last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineWifiDevice[{#SITEID}],#2)=1 and
+            find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")=1
+          recovery_mode: RECOVERY_EXPRESSION
+          recovery_expression: last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineWifiDevice[{#SITEID}])<>1
           name: Site has 1 offline WiFi device
           priority: AVERAGE
-          description: One wireless access point at this site has gone offline. Clients in its coverage area will lose 
+          description: One wireless access point at this site has gone offline. Clients in its coverage area will lose
             connectivity and may not roam to adjacent APs. Check PoE power on its switch port and the uplink cable.
+            Requires two consecutive samples and is suppressed while the console is not cloud-connected - these counts
+            are cloud-derived, so during a site WAN outage or failover they describe lost visibility, not real device
+            state.
         - uuid: 060d044277504273a0e24c9db417312c
-          expression: last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineWifiDevice[{#SITEID}])>1
+          expression: last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineWifiDevice[{#SITEID}])>1 and
+            last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineWifiDevice[{#SITEID}],#2)>1 and
+            find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")=1
+          recovery_mode: RECOVERY_EXPRESSION
+          recovery_expression: last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineWifiDevice[{#SITEID}])<=1
           name: Site has {ITEM.LASTVALUE} offline WiFi devices
           priority: HIGH
           description: Multiple wireless access points are offline simultaneously. A shared PoE switch port issue, power
-            failure, or upstream switch disconnection is the likely cause. Check the switch that serves the affected 
-            APs.
+            failure, or upstream switch disconnection is the likely cause. Check the switch that serves the affected
+            APs. Requires two consecutive samples and is suppressed while the console is not cloud-connected - these
+            counts are cloud-derived, so during a site WAN outage or failover they describe lost visibility, not real
+            device state.
       - uuid: c964e392442d4d8c9c47ec71f9c38752
         name: Offline Wired Devices
         type: DEPENDENT
@@ -3288,7 +3407,7 @@ zabbix_export:
           error_handler_params: '0'
         - type: DISCARD_UNCHANGED_HEARTBEAT
           parameters:
-          - 10m
+          - 2m
         master_item:
           key: unifi.api.host.sites
         tags:
@@ -3296,17 +3415,29 @@ zabbix_export:
           value: site
         trigger_prototypes:
         - uuid: c4e0a13441e44474a195706d7a7d0899
-          expression: last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineWiredDevice[{#SITEID}])=1
+          expression: last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineWiredDevice[{#SITEID}])=1 and
+            last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineWiredDevice[{#SITEID}],#2)=1 and
+            find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")=1
+          recovery_mode: RECOVERY_EXPRESSION
+          recovery_expression: last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineWiredDevice[{#SITEID}])<>1
           name: Site has 1 offline wired device
           priority: AVERAGE
           description: One wired device (switch or gateway) at this site has gone offline. Check the device power supply
-            and its uplink connectivity.
+            and its uplink connectivity. Requires two consecutive samples and is suppressed while the console is not
+            cloud-connected - these counts are cloud-derived, so during a site WAN outage or failover they describe lost
+            visibility, not real device state.
         - uuid: 57a4bee28d474436a8f705085b45c481
-          expression: last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineWiredDevice[{#SITEID}])>1
+          expression: last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineWiredDevice[{#SITEID}])>1 and
+            last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineWiredDevice[{#SITEID}],#2)>1 and
+            find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")=1
+          recovery_mode: RECOVERY_EXPRESSION
+          recovery_expression: last(/Ubiquiti UniFi API Host/unifi.api.host.site.offlineWiredDevice[{#SITEID}])<=1
           name: Site has {ITEM.LASTVALUE} offline wired devices
           priority: HIGH
-          description: Multiple wired devices are offline simultaneously. This suggests a shared upstream switch or 
-            power failure. Investigate the common upstream path first.
+          description: Multiple wired devices are offline simultaneously. This suggests a shared upstream switch or
+            power failure. Investigate the common upstream path first. Requires two consecutive samples and is
+            suppressed while the console is not cloud-connected - these counts are cloud-derived, so during a site WAN
+            outage or failover they describe lost visibility, not real device state.
       - uuid: 8c85ca5563cd4270a0d3e43a4874e5c5
         name: Devices Pending Update
         type: DEPENDENT
@@ -3445,7 +3576,7 @@ zabbix_export:
           error_handler_params: '0'
         - type: DISCARD_UNCHANGED_HEARTBEAT
           parameters:
-          - 10m
+          - 2m
         master_item:
           key: unifi.api.host.sites
         tags:
@@ -3453,12 +3584,18 @@ zabbix_export:
           value: site
         trigger_prototypes:
         - uuid: 14cf21e135c24539aca39b95810c8975
-          expression: last(/Ubiquiti UniFi API Host/unifi.api.host.site.gatewayDevice[{#SITEID}])=0
+          expression: last(/Ubiquiti UniFi API Host/unifi.api.host.site.gatewayDevice[{#SITEID}])=0 and
+            last(/Ubiquiti UniFi API Host/unifi.api.host.site.gatewayDevice[{#SITEID}],#2)=0 and
+            find(/Ubiquiti UniFi API Host/unifi.api.host.state,#1,"regexp","connected")=1
+          recovery_mode: RECOVERY_EXPRESSION
+          recovery_expression: last(/Ubiquiti UniFi API Host/unifi.api.host.site.gatewayDevice[{#SITEID}])>0
           name: Site has no gateway device
           priority: DISASTER
           description: No gateway is visible at this site - all routing and internet connectivity for this site is down.
-            Check site power, the gateway WAN link, and the management network. This is the most severe site-level 
-            condition.
+            Check site power, the gateway WAN link, and the management network. This is the most severe site-level
+            condition. Requires two consecutive samples and is suppressed while the console is not cloud-connected -
+            this count is cloud-derived, so during a site WAN outage or failover it describes lost visibility, not real
+            device state.
       - uuid: 6f8ebe2f29704cae8f5c222de65f1036
         name: WAN Uptime
         type: DEPENDENT
@@ -3858,6 +3995,9 @@ zabbix_export:
         - macro: '{$HOSTID}'
           value: '{#PARENTHOSTID}'
           description: Parent gateway host ID
+        - macro: '{$UNIFI.LOCAL.PORT}'
+          value: '{#LOCALPORT}'
+          description: Local controller HTTPS port, inherited from the root host's default at discovery time
         - macro: '{$UNIFI.LOCAL.IP}'
           value: '{#LOCALIP}'
           description: Local controller IP
@@ -3878,7 +4018,7 @@ zabbix_export:
         interfaces:
         - ip: '{#DEVICEIP}'
       master_item:
-        key: unifi.api.host.devices
+        key: unifi.discover.devices.src
       lld_macro_paths:
       - lld_macro: '{#DEVICEID}'
         path: $.id
@@ -3896,6 +4036,8 @@ zabbix_export:
         path: $.shortname
       - lld_macro: '{#LOCALIP}'
         path: $.localIp
+      - lld_macro: '{#LOCALPORT}'
+        path: $.localPort
       - lld_macro: '{#DEVICEIP}'
         path: $.deviceIp
       - lld_macro: '{#USERNAME}'
@@ -3915,6 +4057,7 @@ zabbix_export:
           var d = JSON.parse(value);
           var hostId = '{$HOSTID}';
           var localIp = '{$UNIFI.LOCAL.IP}';
+          var localPort = '{$UNIFI.LOCAL.PORT}';
           var username = '{$UNIFI.USERNAME}';
           var password = '{$UNIFI.PASSWORD}';
           var token = d.token;
@@ -3928,6 +4071,7 @@ zabbix_export:
           for (var j = 0; j < devices.length; j++) {
               devices[j].parentHostId = hostId;
               devices[j].localIp = localIp;
+              devices[j].localPort = localPort;
               devices[j].username = username;
               devices[j].password = password;
               devices[j].sessionToken = token;
@@ -3983,6 +4127,9 @@ zabbix_export:
         - macro: '{$HOSTID}'
           value: '{#PARENTHOSTID}'
           description: Parent gateway host ID
+        - macro: '{$UNIFI.LOCAL.PORT}'
+          value: '{#LOCALPORT}'
+          description: Local controller HTTPS port, inherited from the root host's default at discovery time
         - macro: '{$UNIFI.LOCAL.IP}'
           value: '{#LOCALIP}'
           description: Local controller IP
@@ -4003,7 +4150,7 @@ zabbix_export:
         interfaces:
         - ip: '{#DEVICEIP}'
       master_item:
-        key: unifi.api.host.devices
+        key: unifi.discover.devices.src
       lld_macro_paths:
       - lld_macro: '{#DEVICEID}'
         path: $.id
@@ -4021,6 +4168,8 @@ zabbix_export:
         path: $.shortname
       - lld_macro: '{#LOCALIP}'
         path: $.localIp
+      - lld_macro: '{#LOCALPORT}'
+        path: $.localPort
       - lld_macro: '{#DEVICEIP}'
         path: $.deviceIp
       - lld_macro: '{#USERNAME}'
@@ -4040,6 +4189,7 @@ zabbix_export:
           var d = JSON.parse(value);
           var hostId = '{$HOSTID}';
           var localIp = '{$UNIFI.LOCAL.IP}';
+          var localPort = '{$UNIFI.LOCAL.PORT}';
           var username = '{$UNIFI.USERNAME}';
           var password = '{$UNIFI.PASSWORD}';
           var token = d.token;
@@ -4053,6 +4203,7 @@ zabbix_export:
           for (var j = 0; j < devices.length; j++) {
               devices[j].parentHostId = hostId;
               devices[j].localIp = localIp;
+              devices[j].localPort = localPort;
               devices[j].username = username;
               devices[j].password = password;
               devices[j].sessionToken = token;
@@ -4108,6 +4259,9 @@ zabbix_export:
         - macro: '{$HOSTID}'
           value: '{#PARENTHOSTID}'
           description: Parent gateway host ID
+        - macro: '{$UNIFI.LOCAL.PORT}'
+          value: '{#LOCALPORT}'
+          description: Local controller HTTPS port, inherited from the root host's default at discovery time
         - macro: '{$UNIFI.LOCAL.IP}'
           value: '{#LOCALIP}'
           description: Local controller IP
@@ -4128,7 +4282,7 @@ zabbix_export:
         interfaces:
         - ip: '{#DEVICEIP}'
       master_item:
-        key: unifi.api.host.devices
+        key: unifi.discover.devices.src
       lld_macro_paths:
       - lld_macro: '{#DEVICEID}'
         path: $.id
@@ -4146,6 +4300,8 @@ zabbix_export:
         path: $.shortname
       - lld_macro: '{#LOCALIP}'
         path: $.localIp
+      - lld_macro: '{#LOCALPORT}'
+        path: $.localPort
       - lld_macro: '{#DEVICEIP}'
         path: $.deviceIp
       - lld_macro: '{#USERNAME}'
@@ -4165,6 +4321,7 @@ zabbix_export:
           var d = JSON.parse(value);
           var hostId = '{$HOSTID}';
           var localIp = '{$UNIFI.LOCAL.IP}';
+          var localPort = '{$UNIFI.LOCAL.PORT}';
           var username = '{$UNIFI.USERNAME}';
           var password = '{$UNIFI.PASSWORD}';
           var token = d.token;
@@ -4178,6 +4335,7 @@ zabbix_export:
           for (var j = 0; j < devices.length; j++) {
               devices[j].parentHostId = hostId;
               devices[j].localIp = localIp;
+              devices[j].localPort = localPort;
               devices[j].username = username;
               devices[j].password = password;
               devices[j].sessionToken = token;
@@ -4233,6 +4391,9 @@ zabbix_export:
         - macro: '{$HOSTID}'
           value: '{#PARENTHOSTID}'
           description: Parent gateway host ID
+        - macro: '{$UNIFI.LOCAL.PORT}'
+          value: '{#LOCALPORT}'
+          description: Local controller HTTPS port, inherited from the root host's default at discovery time
         - macro: '{$UNIFI.LOCAL.IP}'
           value: '{#LOCALIP}'
           description: Local controller IP
@@ -4253,7 +4414,7 @@ zabbix_export:
         interfaces:
         - ip: '{#DEVICEIP}'
       master_item:
-        key: unifi.api.host.devices
+        key: unifi.discover.devices.src
       lld_macro_paths:
       - lld_macro: '{#DEVICEID}'
         path: $.id
@@ -4271,6 +4432,8 @@ zabbix_export:
         path: $.shortname
       - lld_macro: '{#LOCALIP}'
         path: $.localIp
+      - lld_macro: '{#LOCALPORT}'
+        path: $.localPort
       - lld_macro: '{#DEVICEIP}'
         path: $.deviceIp
       - lld_macro: '{#USERNAME}'
@@ -4290,6 +4453,7 @@ zabbix_export:
           var d = JSON.parse(value);
           var hostId = '{$HOSTID}';
           var localIp = '{$UNIFI.LOCAL.IP}';
+          var localPort = '{$UNIFI.LOCAL.PORT}';
           var username = '{$UNIFI.USERNAME}';
           var password = '{$UNIFI.PASSWORD}';
           var token = d.token;
@@ -4303,6 +4467,7 @@ zabbix_export:
           for (var j = 0; j < devices.length; j++) {
               devices[j].parentHostId = hostId;
               devices[j].localIp = localIp;
+              devices[j].localPort = localPort;
               devices[j].username = username;
               devices[j].password = password;
               devices[j].sessionToken = token;
@@ -4372,6 +4537,9 @@ zabbix_export:
         - macro: '{$HOSTID}'
           value: '{#PARENTHOSTID}'
           description: Parent gateway host ID
+        - macro: '{$UNIFI.LOCAL.PORT}'
+          value: '{#LOCALPORT}'
+          description: Local controller HTTPS port, inherited from the root host's default at discovery time
         - macro: '{$UNIFI.LOCAL.IP}'
           value: '{#LOCALIP}'
           description: Local controller IP
@@ -4385,7 +4553,7 @@ zabbix_export:
         interfaces:
         - ip: '{#DEVICEIP}'
       master_item:
-        key: unifi.api.host.devices
+        key: unifi.discover.devices.src
       lld_macro_paths:
       - lld_macro: '{#DEVICEID}'
         path: $.id
@@ -4403,6 +4571,8 @@ zabbix_export:
         path: $.shortname
       - lld_macro: '{#LOCALIP}'
         path: $.localIp
+      - lld_macro: '{#LOCALPORT}'
+        path: $.localPort
       - lld_macro: '{#DEVICEIP}'
         path: $.deviceIp
       - lld_macro: '{#USERNAME}'
@@ -4418,6 +4588,7 @@ zabbix_export:
           var d = JSON.parse(value);
           var hostId = '{$HOSTID}';
           var localIp = '{$UNIFI.LOCAL.IP}';
+          var localPort = '{$UNIFI.LOCAL.PORT}';
           var username = '{$UNIFI.USERNAME}';
           var password = '{$UNIFI.PASSWORD}';
           var rec = null;
@@ -4429,6 +4600,7 @@ zabbix_export:
           for (var j = 0; j < devices.length; j++) {
               devices[j].parentHostId = hostId;
               devices[j].localIp = localIp;
+              devices[j].localPort = localPort;
               devices[j].username = username;
               devices[j].password = password;
               devices[j].deviceIp = devices[j].ip || '';
@@ -4980,6 +5152,9 @@ zabbix_export:
         - macro: '{$HOSTID}'
           value: '{#PARENTHOSTID}'
           description: Parent gateway host ID
+        - macro: '{$UNIFI.LOCAL.PORT}'
+          value: '{#LOCALPORT}'
+          description: Local controller HTTPS port, inherited from the root host's default at discovery time
         - macro: '{$UNIFI.LOCAL.IP}'
           value: '{#LOCALIP}'
           description: Local controller IP
@@ -5014,6 +5189,8 @@ zabbix_export:
         path: $.parentHostId
       - lld_macro: '{#LOCALIP}'
         path: $.localIp
+      - lld_macro: '{#LOCALPORT}'
+        path: $.localPort
       - lld_macro: '{#DEVICEIP}'
         path: $.deviceIp
       - lld_macro: '{#USERNAME}'
@@ -5033,6 +5210,7 @@ zabbix_export:
           var d = JSON.parse(value);
           var hostId = '{$HOSTID}';
           var localIp = '{$UNIFI.LOCAL.IP}';
+          var localPort = '{$UNIFI.LOCAL.PORT}';
           var username = '{$UNIFI.USERNAME}';
           var password = '{$UNIFI.PASSWORD}';
           var token = d.token;
@@ -5041,6 +5219,7 @@ zabbix_export:
           for (var j = 0; j < devices.length; j++) {
               devices[j].parentHostId = hostId;
               devices[j].localIp = localIp;
+              devices[j].localPort = localPort;
               devices[j].username = username;
               devices[j].password = password;
               devices[j].sessionToken = token;
@@ -5083,6 +5262,9 @@ zabbix_export:
         - macro: '{$HOSTID}'
           value: '{#PARENTHOSTID}'
           description: Parent gateway host ID
+        - macro: '{$UNIFI.LOCAL.PORT}'
+          value: '{#LOCALPORT}'
+          description: Local controller HTTPS port, inherited from the root host's default at discovery time
         - macro: '{$UNIFI.LOCAL.IP}'
           value: '{#LOCALIP}'
           description: Local controller IP
@@ -5117,6 +5299,8 @@ zabbix_export:
         path: $.parentHostId
       - lld_macro: '{#LOCALIP}'
         path: $.localIp
+      - lld_macro: '{#LOCALPORT}'
+        path: $.localPort
       - lld_macro: '{#DEVICEIP}'
         path: $.deviceIp
       - lld_macro: '{#USERNAME}'
@@ -5136,6 +5320,7 @@ zabbix_export:
           var d = JSON.parse(value);
           var hostId = '{$HOSTID}';
           var localIp = '{$UNIFI.LOCAL.IP}';
+          var localPort = '{$UNIFI.LOCAL.PORT}';
           var username = '{$UNIFI.USERNAME}';
           var password = '{$UNIFI.PASSWORD}';
           var token = d.token;
@@ -5149,6 +5334,7 @@ zabbix_export:
           for (var j = 0; j < devices.length; j++) {
               devices[j].parentHostId = hostId;
               devices[j].localIp = localIp;
+              devices[j].localPort = localPort;
               devices[j].username = username;
               devices[j].password = password;
               devices[j].sessionToken = token;
@@ -5178,6 +5364,17 @@ zabbix_export:
     - macro: '{$UNIFI.WAN.LATENCY.WARN}'
       value: '100'
       description: WAN latency warning threshold (ms). UK home typical RTT is 10–30ms.
+    - macro: '{$UNIFI.CONSOLE.OFFLINE.GRACE}'
+      value: 3m
+      description: 'How long the console must be continuously cloud-disconnected before "Console lost cloud connectivity"
+        fires. Sized to ride out a WAN failover between two uplinks (typically 1-2 minutes of cloud disconnection)
+        without alarming, while still catching a real outage quickly. Must be longer than the Connection State poll
+        interval (1m) or the trigger can never fire. Default: 3m'
+    - macro: '{$UNIFI.LOCAL.PORT}'
+      value: '443'
+      description: 'Local controller HTTPS port. 443 on UniFi OS consoles (UDM, CloudKey, UX); self-hosted UniFi
+        OS Server uses 11443. Normally inherited from the root host''s default at discovery time, or set here to
+        override for this host. Fallback value only, same reasoning as {$UNIFI.LOCAL.POLL.INTERVAL}.'
     - macro: '{$UNIFI.LOCAL.IP}'
       description: Local management IP of this console - populated from host discovery
     - macro: '{$UNIFI.LOCAL.API.ENABLED}'
@@ -5311,7 +5508,7 @@ zabbix_export:
       Applied to SD-WAN config hosts discovered by Ubiquiti UniFi API. Monitors tunnel health, configuration
       status, and WAN internet issues for each SD-WAN config via /v1/sd-wan-configs/{id}/status.
 
-      Version: 1.5.0
+      Version: 1.6.0
     groups:
     - name: Templates
     items:
@@ -5621,7 +5818,7 @@ zabbix_export:
       Monitors device status, firmware, version, uptime, and IP via cloud API.
       Macros {$HOSTID} and {$DEVICEID} are set automatically by the discovering gateway's host prototype.
 
-      Version: 1.5.0
+      Version: 1.6.0
 
       Template available at https://github.com/kairandles/zabbix-unifi
     groups:
@@ -5676,13 +5873,99 @@ zabbix_export:
       tags:
       - tag: component
         value: device
+    - uuid: 457e86831062444bbe827b99a0da120f
+      name: Offline State
+      type: DEPENDENT
+      key: unifi.api.device.offlineState
+      delay: '0'
+      history: 90d
+      trends: '0'
+      description: 'Alert-ready offline state computed from a single /v1/devices payload: 0 = device online (or not in
+        the payload), 1 = device offline while its console still reads online (a genuine single-device failure - the
+        cloud can see the site fine and this device is gone), 2 = device offline but the console itself also reads
+        offline (the cloud has lost sight of the whole site, so per-device statuses are meaningless - typically a site
+        WAN outage or failover in progress). Both statuses come from the same payload of the same master item, so the
+        1-vs-2 distinction is atomic: there is no window where a site outage can masquerade as a device failure, and no
+        cross-item or cross-host polling race. If the console entry is missing from the payload entirely, offline
+        deliberately resolves to 1 (fail open) rather than silently suppressing offline detection for the site.'
+      preprocessing:
+      - type: JAVASCRIPT
+        parameters:
+        - |
+          var d = JSON.parse(value);
+          var hostId = '{$HOSTID}';
+          var id = '{$DEVICEID}';
+          var devStatus = null;
+          var consoleOffline = false;
+          for (var i = 0; i < d.data.length; i++) {
+              if (d.data[i].hostId !== hostId) continue;
+              var devs = d.data[i].devices || [];
+              for (var j = 0; j < devs.length; j++) {
+                  if (devs[j].id === id) devStatus = devs[j].status || 'unknown';
+                  if (devs[j].isConsole && /offline/.test(String(devs[j].status))) consoleOffline = true;
+              }
+          }
+          if (devStatus === null || !/offline/.test(devStatus)) return 0;
+          return consoleOffline ? 2 : 1;
+      - type: DISCARD_UNCHANGED_HEARTBEAT
+        parameters:
+        - 5m
+      master_item:
+        key: unifi.api.device.raw
+      valuemap:
+        name: Device offline state
+      tags:
+      - tag: component
+        value: device
       triggers:
       - uuid: f7c0cd7ab5e1468a82727ab23d407f9c
-        expression: find(/Ubiquiti UniFi Device/unifi.api.device.status,#1,"regexp","offline")=1
+        expression: last(/Ubiquiti UniFi Device/unifi.api.device.offlineState)=1
+        recovery_mode: RECOVERY_EXPRESSION
+        recovery_expression: last(/Ubiquiti UniFi Device/unifi.api.device.offlineState)=0
         name: '{HOST.NAME} is offline'
         priority: HIGH
-        description: This UniFi device has gone offline. Check physical power, PoE on the uplink switch port, and any
-          upstream switch. If this is an AP, check nearby clients for connectivity loss.
+        description: This UniFi device has gone offline while its console was still cloud-connected - a genuine
+          single-device failure, not a site-wide outage. Check physical power, PoE on the uplink switch port, and any
+          upstream switch. If this is an AP, check nearby clients for connectivity loss. Fires on the first offline
+          sample (~1 minute), because the site-outage distinction is made atomically inside the Offline State item
+          rather than by waiting for confirmation. While the whole site is dark (state 2) no new problem is raised, and
+          an already-open problem is held open rather than flap-closed; a device that stays offline after the site comes
+          back alerts within a poll cycle.
+    - uuid: f7b52deef83d41168b5d0b1a21ffbe2d
+      name: Console Status
+      type: DEPENDENT
+      key: unifi.api.device.consoleStatus
+      delay: '0'
+      history: 90d
+      value_type: TEXT
+      trends: '0'
+      description: Cloud-reported status of this device's own console, extracted from the same /v1/devices payload as
+        the device Status item (the console lists itself with isConsole=true). Collected for visibility - when the
+        console reads offline, the cloud cannot see the site at all and every per-device status is meaningless. The
+        actual offline alerting decision is made atomically inside the Offline State item, not by comparing this item
+        against Status in a trigger. Reads 'unknown' if no console entry is present in the payload.
+      preprocessing:
+      - type: JAVASCRIPT
+        parameters:
+        - |
+          var d = JSON.parse(value);
+          var hostId = '{$HOSTID}';
+          for (var i = 0; i < d.data.length; i++) {
+              if (d.data[i].hostId !== hostId) continue;
+              var devs = d.data[i].devices || [];
+              for (var j = 0; j < devs.length; j++) {
+                  if (devs[j].isConsole) return devs[j].status || 'unknown';
+              }
+          }
+          return 'unknown';
+      - type: DISCARD_UNCHANGED_HEARTBEAT
+        parameters:
+        - 5m
+      master_item:
+        key: unifi.api.device.raw
+      tags:
+      - tag: component
+        value: device
     - uuid: c1b1a32e7be247d689ac64750071cd79
       name: Firmware Status
       type: DEPENDENT
@@ -5916,6 +6199,15 @@ zabbix_export:
     - macro: '{$MODEL}'
       description: Device model - set automatically by host prototype discovery
     valuemaps:
+    - uuid: c0650fd02da44cc5a27e54cd4b5e895f
+      name: Device offline state
+      mappings:
+      - value: '0'
+        newvalue: Online
+      - value: '1'
+        newvalue: Offline
+      - value: '2'
+        newvalue: 'Unknown - console offline'
     - uuid: 5995b8e5c09846538ef9b06abfa2ca6f
       name: Service state
       mappings:
@@ -5930,7 +6222,7 @@ zabbix_export:
       Local controller polling for UniFi Access Points. Applied alongside Ubiquiti UniFi Device by host
       prototype discovery.
 
-      Version: 1.5.0
+      Version: 1.6.0
     groups:
     - name: Templates
     items:
@@ -5942,7 +6234,7 @@ zabbix_export:
       history: 1h
       value_type: TEXT
       trends: '0'
-      url: https://{$UNIFI.LOCAL.IP}/{$UNIFI.API.URI}/device
+      url: https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/device
       timeout: 10s
       headers:
       - name: Cookie
@@ -5966,7 +6258,7 @@ zabbix_export:
 
                   var loginReq = new HttpRequest();
                   loginReq.addHeader('Content-Type: application/json');
-                  loginReq.post('https://{$UNIFI.LOCAL.IP}/{$UNIFI.API.AUTH.URI}',
+                  loginReq.post('https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.AUTH.URI}',
                       JSON.stringify({username: '{$UNIFI.USERNAME}', password: '{$UNIFI.PASSWORD}'}));
                   if (loginReq.getStatus() !== 200) throw 'fresh login HTTP ' + loginReq.getStatus();
 
@@ -5978,7 +6270,7 @@ zabbix_export:
 
                   var dataReq = new HttpRequest();
                   dataReq.addHeader('Cookie: {$UNIFI.API.AUTH.TOKEN}=' + m[1]);
-                  var dataResp = dataReq.get('https://{$UNIFI.LOCAL.IP}/{$UNIFI.API.URI}/device');
+                  var dataResp = dataReq.get('https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/device');
                   if (dataReq.getStatus() !== 200) throw 'fresh GET HTTP ' + dataReq.getStatus();
                   d = JSON.parse(dataResp);
                   if (!d || !Array.isArray(d.data)) throw 'fresh GET: unexpected response shape';
@@ -6025,7 +6317,8 @@ zabbix_export:
           suppressed if the cloud API is also reporting the device offline, to prevent duplicate alerts.
         dependencies:
         - name: '{HOST.NAME} is offline'
-          expression: find(/Ubiquiti UniFi Device/unifi.api.device.status,#1,"regexp","offline")=1
+          expression: last(/Ubiquiti UniFi Device/unifi.api.device.offlineState)=1
+          recovery_expression: last(/Ubiquiti UniFi Device/unifi.api.device.offlineState)=0
     - uuid: 786d50d6e6c740c2ab29f35a05b7a3fb
       name: CPU Usage
       type: DEPENDENT
@@ -6459,6 +6752,11 @@ zabbix_export:
     macros:
     - macro: '{$DEVICEID}'
       description: Device MAC - set by host prototype
+    - macro: '{$UNIFI.LOCAL.PORT}'
+      value: '443'
+      description: 'Local controller HTTPS port. 443 on UniFi OS consoles (UDM, CloudKey, UX); self-hosted UniFi
+        OS Server uses 11443. Normally inherited from the root host''s default at discovery time, or set here to
+        override for this host. Fallback value only, same reasoning as {$UNIFI.LOCAL.POLL.INTERVAL}.'
     - macro: '{$UNIFI.LOCAL.IP}'
       description: Local controller IP - set by host prototype
     - macro: '{$UNIFI.USERNAME}'
@@ -6508,7 +6806,7 @@ zabbix_export:
       Local controller polling for UniFi Switches. Applied alongside Ubiquiti UniFi Device by host prototype
       discovery.
 
-      Version: 1.5.0
+      Version: 1.6.0
     groups:
     - name: Templates
     items:
@@ -6520,7 +6818,7 @@ zabbix_export:
       history: 1h
       value_type: TEXT
       trends: '0'
-      url: https://{$UNIFI.LOCAL.IP}/{$UNIFI.API.URI}/device
+      url: https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/device
       timeout: 10s
       headers:
       - name: Cookie
@@ -6544,7 +6842,7 @@ zabbix_export:
 
                   var loginReq = new HttpRequest();
                   loginReq.addHeader('Content-Type: application/json');
-                  loginReq.post('https://{$UNIFI.LOCAL.IP}/{$UNIFI.API.AUTH.URI}',
+                  loginReq.post('https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.AUTH.URI}',
                       JSON.stringify({username: '{$UNIFI.USERNAME}', password: '{$UNIFI.PASSWORD}'}));
                   if (loginReq.getStatus() !== 200) throw 'fresh login HTTP ' + loginReq.getStatus();
 
@@ -6556,7 +6854,7 @@ zabbix_export:
 
                   var dataReq = new HttpRequest();
                   dataReq.addHeader('Cookie: {$UNIFI.API.AUTH.TOKEN}=' + m[1]);
-                  var dataResp = dataReq.get('https://{$UNIFI.LOCAL.IP}/{$UNIFI.API.URI}/device');
+                  var dataResp = dataReq.get('https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/device');
                   if (dataReq.getStatus() !== 200) throw 'fresh GET HTTP ' + dataReq.getStatus();
                   d = JSON.parse(dataResp);
                   if (!d || !Array.isArray(d.data)) throw 'fresh GET: unexpected response shape';
@@ -6600,7 +6898,8 @@ zabbix_export:
         priority: HIGH
         dependencies:
         - name: '{HOST.NAME} is offline'
-          expression: find(/Ubiquiti UniFi Device/unifi.api.device.status,#1,"regexp","offline")=1
+          expression: last(/Ubiquiti UniFi Device/unifi.api.device.offlineState)=1
+          recovery_expression: last(/Ubiquiti UniFi Device/unifi.api.device.offlineState)=0
         description: The local UniFi controller is reporting this device as offline (state ≠ 1). The device may have 
           lost power, its uplink connection, or the controller has lost management reachability. This trigger is 
           suppressed if the cloud API is also reporting the device offline, to prevent duplicate alerts.
@@ -7761,6 +8060,11 @@ zabbix_export:
     macros:
     - macro: '{$DEVICEID}'
       description: Device MAC - set by host prototype
+    - macro: '{$UNIFI.LOCAL.PORT}'
+      value: '443'
+      description: 'Local controller HTTPS port. 443 on UniFi OS consoles (UDM, CloudKey, UX); self-hosted UniFi
+        OS Server uses 11443. Normally inherited from the root host''s default at discovery time, or set here to
+        override for this host. Fallback value only, same reasoning as {$UNIFI.LOCAL.POLL.INTERVAL}.'
     - macro: '{$UNIFI.LOCAL.IP}'
       description: Local controller IP - set by host prototype
     - macro: '{$UNIFI.USERNAME}'
@@ -7838,7 +8142,7 @@ zabbix_export:
       Local controller polling for USW-Deployed-24 (USWDA) with battery backup. Applied alongside Ubiquiti
       UniFi Device by host prototype discovery.
 
-      Version: 1.5.0
+      Version: 1.6.0
     groups:
     - name: Templates
     items:
@@ -7850,7 +8154,7 @@ zabbix_export:
       history: 1h
       value_type: TEXT
       trends: '0'
-      url: https://{$UNIFI.LOCAL.IP}/{$UNIFI.API.URI}/device
+      url: https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/device
       timeout: 10s
       headers:
       - name: Cookie
@@ -7874,7 +8178,7 @@ zabbix_export:
 
                   var loginReq = new HttpRequest();
                   loginReq.addHeader('Content-Type: application/json');
-                  loginReq.post('https://{$UNIFI.LOCAL.IP}/{$UNIFI.API.AUTH.URI}',
+                  loginReq.post('https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.AUTH.URI}',
                       JSON.stringify({username: '{$UNIFI.USERNAME}', password: '{$UNIFI.PASSWORD}'}));
                   if (loginReq.getStatus() !== 200) throw 'fresh login HTTP ' + loginReq.getStatus();
 
@@ -7886,7 +8190,7 @@ zabbix_export:
 
                   var dataReq = new HttpRequest();
                   dataReq.addHeader('Cookie: {$UNIFI.API.AUTH.TOKEN}=' + m[1]);
-                  var dataResp = dataReq.get('https://{$UNIFI.LOCAL.IP}/{$UNIFI.API.URI}/device');
+                  var dataResp = dataReq.get('https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/device');
                   if (dataReq.getStatus() !== 200) throw 'fresh GET HTTP ' + dataReq.getStatus();
                   d = JSON.parse(dataResp);
                   if (!d || !Array.isArray(d.data)) throw 'fresh GET: unexpected response shape';
@@ -7930,7 +8234,8 @@ zabbix_export:
         priority: HIGH
         dependencies:
         - name: '{HOST.NAME} is offline'
-          expression: find(/Ubiquiti UniFi Device/unifi.api.device.status,#1,"regexp","offline")=1
+          expression: last(/Ubiquiti UniFi Device/unifi.api.device.offlineState)=1
+          recovery_expression: last(/Ubiquiti UniFi Device/unifi.api.device.offlineState)=0
         description: The local UniFi controller is reporting this device as offline (state ≠ 1). The device may have 
           lost power, its uplink connection, or the controller has lost management reachability. This trigger is 
           suppressed if the cloud API is also reporting the device offline, to prevent duplicate alerts.
@@ -8178,6 +8483,11 @@ zabbix_export:
     macros:
     - macro: '{$DEVICEID}'
       description: Device MAC - set by host prototype
+    - macro: '{$UNIFI.LOCAL.PORT}'
+      value: '443'
+      description: 'Local controller HTTPS port. 443 on UniFi OS consoles (UDM, CloudKey, UX); self-hosted UniFi
+        OS Server uses 11443. Normally inherited from the root host''s default at discovery time, or set here to
+        override for this host. Fallback value only, same reasoning as {$UNIFI.LOCAL.POLL.INTERVAL}.'
     - macro: '{$UNIFI.LOCAL.IP}'
       description: Local controller IP - set by host prototype
     - macro: '{$UNIFI.USERNAME}'
@@ -8236,7 +8546,7 @@ zabbix_export:
       Local controller polling for USP-RPS (Redundant Power Supply). Monitors PSU failover state - DISASTER
       fires when a connected device loses its primary PSU and the RPS takes over.
 
-      Version: 1.5.0
+      Version: 1.6.0
     groups:
     - name: Templates
     items:
@@ -8248,7 +8558,7 @@ zabbix_export:
       history: 1h
       value_type: TEXT
       trends: '0'
-      url: https://{$UNIFI.LOCAL.IP}/{$UNIFI.API.URI}/device
+      url: https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/device
       timeout: 10s
       headers:
       - name: Cookie
@@ -8272,7 +8582,7 @@ zabbix_export:
 
                   var loginReq = new HttpRequest();
                   loginReq.addHeader('Content-Type: application/json');
-                  loginReq.post('https://{$UNIFI.LOCAL.IP}/{$UNIFI.API.AUTH.URI}',
+                  loginReq.post('https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.AUTH.URI}',
                       JSON.stringify({username: '{$UNIFI.USERNAME}', password: '{$UNIFI.PASSWORD}'}));
                   if (loginReq.getStatus() !== 200) throw 'fresh login HTTP ' + loginReq.getStatus();
 
@@ -8284,7 +8594,7 @@ zabbix_export:
 
                   var dataReq = new HttpRequest();
                   dataReq.addHeader('Cookie: {$UNIFI.API.AUTH.TOKEN}=' + m[1]);
-                  var dataResp = dataReq.get('https://{$UNIFI.LOCAL.IP}/{$UNIFI.API.URI}/device');
+                  var dataResp = dataReq.get('https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/device');
                   if (dataReq.getStatus() !== 200) throw 'fresh GET HTTP ' + dataReq.getStatus();
                   d = JSON.parse(dataResp);
                   if (!d || !Array.isArray(d.data)) throw 'fresh GET: unexpected response shape';
@@ -8328,7 +8638,8 @@ zabbix_export:
         priority: HIGH
         dependencies:
         - name: '{HOST.NAME} is offline'
-          expression: find(/Ubiquiti UniFi Device/unifi.api.device.status,#1,"regexp","offline")=1
+          expression: last(/Ubiquiti UniFi Device/unifi.api.device.offlineState)=1
+          recovery_expression: last(/Ubiquiti UniFi Device/unifi.api.device.offlineState)=0
         description: The local UniFi controller is reporting this device as offline (state ≠ 1). The device may have 
           lost power, its uplink connection, or the controller has lost management reachability. This trigger is 
           suppressed if the cloud API is also reporting the device offline, to prevent duplicate alerts.
@@ -8732,6 +9043,11 @@ zabbix_export:
     macros:
     - macro: '{$DEVICEID}'
       description: Device MAC - set by host prototype
+    - macro: '{$UNIFI.LOCAL.PORT}'
+      value: '443'
+      description: 'Local controller HTTPS port. 443 on UniFi OS consoles (UDM, CloudKey, UX); self-hosted UniFi
+        OS Server uses 11443. Normally inherited from the root host''s default at discovery time, or set here to
+        override for this host. Fallback value only, same reasoning as {$UNIFI.LOCAL.POLL.INTERVAL}.'
     - macro: '{$UNIFI.LOCAL.IP}'
       description: Local controller IP - set by host prototype
     - macro: '{$UNIFI.USERNAME}'
@@ -8792,7 +9108,7 @@ zabbix_export:
       Protect Cameras" on Ubiquiti UniFi API Host. Reuses the same session token already cached by that console's
       unifi.host.session item - no separate login or credentials of its own.
 
-      Version: 1.5.0
+      Version: 1.6.0
     groups:
     - name: Templates
     items:
@@ -8804,7 +9120,7 @@ zabbix_export:
       history: 1h
       value_type: TEXT
       trends: '0'
-      url: https://{$UNIFI.LOCAL.IP}/{$UNIFI.PROTECT.API.URI}/bootstrap
+      url: https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.PROTECT.API.URI}/bootstrap
       timeout: 10s
       headers:
       - name: Cookie
@@ -8828,7 +9144,7 @@ zabbix_export:
 
                   var loginReq = new HttpRequest();
                   loginReq.addHeader('Content-Type: application/json');
-                  loginReq.post('https://{$UNIFI.LOCAL.IP}/{$UNIFI.API.AUTH.URI}',
+                  loginReq.post('https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.AUTH.URI}',
                       JSON.stringify({username: '{$UNIFI.USERNAME}', password: '{$UNIFI.PASSWORD}'}));
                   if (loginReq.getStatus() !== 200) throw 'fresh login HTTP ' + loginReq.getStatus();
 
@@ -8840,7 +9156,7 @@ zabbix_export:
 
                   var dataReq = new HttpRequest();
                   dataReq.addHeader('Cookie: {$UNIFI.API.AUTH.TOKEN}=' + m[1]);
-                  var dataResp = dataReq.get('https://{$UNIFI.LOCAL.IP}/{$UNIFI.PROTECT.API.URI}/bootstrap');
+                  var dataResp = dataReq.get('https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.PROTECT.API.URI}/bootstrap');
                   if (dataReq.getStatus() !== 200) throw 'fresh GET HTTP ' + dataReq.getStatus();
                   d = JSON.parse(dataResp);
                   if (!d || !Array.isArray(d.cameras)) throw 'fresh GET: unexpected response shape';
@@ -9214,6 +9530,11 @@ zabbix_export:
     macros:
     - macro: '{$DEVICEID}'
       description: Protect device internal ID - set by host prototype
+    - macro: '{$UNIFI.LOCAL.PORT}'
+      value: '443'
+      description: 'Local controller HTTPS port. 443 on UniFi OS consoles (UDM, CloudKey, UX); self-hosted UniFi
+        OS Server uses 11443. Normally inherited from the root host''s default at discovery time, or set here to
+        override for this host. Fallback value only, same reasoning as {$UNIFI.LOCAL.POLL.INTERVAL}.'
     - macro: '{$UNIFI.LOCAL.IP}'
       description: Local controller IP - set by host prototype
     - macro: '{$UNIFI.USERNAME}'
@@ -9250,7 +9571,7 @@ zabbix_export:
       types have no recording concept. Reuses the same session token already cached by that console's
       unifi.host.session item - no separate login or credentials of its own.
 
-      Version: 1.5.0
+      Version: 1.6.0
     groups:
     - name: Templates
     items:
@@ -9262,7 +9583,7 @@ zabbix_export:
       history: 1h
       value_type: TEXT
       trends: '0'
-      url: https://{$UNIFI.LOCAL.IP}/{$UNIFI.PROTECT.API.URI}/bootstrap
+      url: https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.PROTECT.API.URI}/bootstrap
       timeout: 10s
       headers:
       - name: Cookie
@@ -9296,7 +9617,7 @@ zabbix_export:
 
                   var loginReq = new HttpRequest();
                   loginReq.addHeader('Content-Type: application/json');
-                  loginReq.post('https://{$UNIFI.LOCAL.IP}/{$UNIFI.API.AUTH.URI}',
+                  loginReq.post('https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.AUTH.URI}',
                       JSON.stringify({username: '{$UNIFI.USERNAME}', password: '{$UNIFI.PASSWORD}'}));
                   if (loginReq.getStatus() !== 200) throw 'fresh login HTTP ' + loginReq.getStatus();
 
@@ -9308,7 +9629,7 @@ zabbix_export:
 
                   var dataReq = new HttpRequest();
                   dataReq.addHeader('Cookie: {$UNIFI.API.AUTH.TOKEN}=' + m[1]);
-                  var dataResp = dataReq.get('https://{$UNIFI.LOCAL.IP}/{$UNIFI.PROTECT.API.URI}/bootstrap');
+                  var dataResp = dataReq.get('https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.PROTECT.API.URI}/bootstrap');
                   if (dataReq.getStatus() !== 200) throw 'fresh GET HTTP ' + dataReq.getStatus();
                   d = JSON.parse(dataResp);
                   if (!d) throw 'fresh GET: unexpected response shape';
@@ -9462,6 +9783,11 @@ zabbix_export:
     macros:
     - macro: '{$DEVICEID}'
       description: Protect device internal ID - set by host prototype
+    - macro: '{$UNIFI.LOCAL.PORT}'
+      value: '443'
+      description: 'Local controller HTTPS port. 443 on UniFi OS consoles (UDM, CloudKey, UX); self-hosted UniFi
+        OS Server uses 11443. Normally inherited from the root host''s default at discovery time, or set here to
+        override for this host. Fallback value only, same reasoning as {$UNIFI.LOCAL.POLL.INTERVAL}.'
     - macro: '{$UNIFI.LOCAL.IP}'
       description: Local controller IP - set by host prototype
     - macro: '{$UNIFI.USERNAME}'
