@@ -350,6 +350,7 @@ Common optional overrides:
 | `{$UNIFI.CONSOLE.POLL.INTERVAL}` | `3m` | Default interval for each console's own combined local poll (`Local Raw (Combined)`, a `CALCULATED` item), propagated to every discovered console - override at the root or per-console. Safe to set much lower (e.g. `10s`) for fast WAN/health telemetry - this item doesn't log in itself, so its speed has no effect on login frequency (see [Polling Architecture](#polling-architecture)) |
 | `{$UNIFI.SESSION.REFRESH.INTERVAL}` | `10m` | Default interval for each console's session-token mint + cloud device fetch (`Local Session + Cloud Devices Raw`), propagated to every discovered console - override at the root or per-console. Deliberately conservative rather than cut close to the ~2 hour session token lifetime: the login is cheap either way, but UniFi's local rate limiter is only confirmed to trigger on concurrent logins, not proven safe against a sustained per-minute rate too, so this keeps total login attempts low regardless |
 | `{$UNIFI.LOCAL.PORT}` | `443` | Local controller HTTPS port, propagated to every discovered console and then on to every device. `443` on UniFi OS consoles (UDM, CloudKey, UX); set this to `11443` for self-hosted UniFi OS Server. Override at any tier if a fleet is mixed |
+| `{$UNIFI.API.SITE}` | `default` | Internal name of the UniFi site to poll, propagated to every discovered console and device. See [Finding your site name](#finding-your-site-name) |
 | `{$WAN_UPTIME_WARN}` | `99` | Site-wide combined WAN uptime AVERAGE threshold (%) |
 | `{$WAN_UPTIME_HIGH}` | `95` | Site-wide combined WAN uptime DISASTER threshold (%) |
 | `{$UNIFI.SITE.EXCLUDE}` | *(empty)* | Comma-separated consoles to exclude from discovery, see [Site Discovery Filtering](#site-discovery-filtering) |
@@ -365,8 +366,8 @@ Common optional overrides:
 | `{$UNIFI.PASSWORD}` | *(auto)* | Local controller password - inherited from the root host at discovery time, or overridden here |
 | `{$UNIFI.API.AUTH.URI}` | `api/auth/login` | Login endpoint |
 | `{$UNIFI.API.AUTH.TOKEN}` | `TOKEN` | Session cookie name |
-| `{$UNIFI.API.URI}` | `proxy/network/api/s/default/stat` | Stats endpoint |
-| `{$UNIFI.API.REST.URI}` | `proxy/network/api/s/default/rest` | REST endpoint |
+| `{$UNIFI.API.URI}` | `proxy/network/api/s` | Local API base path, up to but not including the site. Changed in 1.7.0 - it previously held the full path including the site |
+| `{$UNIFI.API.SITE}` | `default` | Internal name of the UniFi site to poll. See [Finding your site name](#finding-your-site-name) |
 | `{$UNIFI.LOCAL.POLL.INTERVAL}` | *(auto)* | Local poll interval - inherited from the root host's default at discovery time, or overridden here for every device on this console |
 | `{$UNIFI.CONSOLE.POLL.INTERVAL}` | *(auto)* | Console combined local poll interval - inherited from the root host's default at discovery time, or overridden here |
 | `{$UNIFI.SESSION.REFRESH.INTERVAL}` | *(auto)* | Session-token refresh interval - inherited from the root host's default at discovery time, or overridden here |
@@ -739,6 +740,30 @@ For gateways where a WAN port is intentionally unused, set a host-level context 
 3. Add the macro name and value, then click **Update**
 
 Changes take effect on the next trigger evaluation (within one poll cycle).
+
+---
+
+## Finding your site name
+
+`{$UNIFI.API.SITE}` is the site's **internal** name, which appears in every local API path. It is not the label shown in the UniFi interface — that's a separate field, and the two are frequently different.
+
+Nearly every install calls its first site `default`, which is why this macro can normally be left alone. A site created by hand gets a generated identifier instead, something like `a1b2c3d4`, and renaming it in the interface only changes the display label. Replacing or deleting the stock default site leaves that generated name in place permanently.
+
+If local items fail with `api.err.NoSiteContext`, this is why. To find your site name, log in to the console and open:
+
+```
+https://<console-ip>/proxy/network/api/self/sites
+```
+
+```json
+{"meta":{"rc":"ok"},"data":[{"name":"default","desc":"Default","role":"admin", ...}]}
+```
+
+Use the **`name`** field. Ignore `desc` (the display label), `_id`, `external_id` and `anonymous_id` — none of those appear in an API path.
+
+If `data` comes back empty, that's a different problem: the account can sign in to UniFi OS but holds no role inside the Network application, which is a separate permission grant from console access.
+
+Set `{$UNIFI.API.SITE}` once on the root host and discovery propagates it to every console and device.
 
 ---
 
