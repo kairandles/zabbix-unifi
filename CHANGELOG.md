@@ -2,6 +2,20 @@
 
 All notable changes to this template set are documented here. Versioning starts at 1.1.0 (2026-07-08); everything before that was tracked by date only, so those older entries are kept as-is rather than renumbered retroactively.
 
+## [1.7.0] - 2026-09-23
+
+> **⚠️ Breaking change.** `{$UNIFI.API.URI}` changes meaning and `{$UNIFI.API.REST.URI}` is removed. If you have never overridden either macro, re-import and carry on — the defaults are equivalent to the old behaviour and nothing changes. If you *have* overridden them, see below before upgrading.
+
+Makes the UniFi site name configurable. Reported in [#6](../../issues/6): local items failing with `api.err.NoSiteContext` on an install whose site is not called `default`.
+
+### Fixed
+- **The UniFi site name is no longer hardcoded as `default`.** Every local API path is of the form `/proxy/network/api/s/<site>/stat/...`, where `<site>` is the site's *internal* name — not the label shown in the interface. The templates had assumed `default` since the first release. That holds on almost every install, because the first site created always gets that name, but a site created by hand gets a generated identifier such as `a1b2c3d4`, and deleting or replacing the stock default site leaves that generated name permanently in place. Anyone in that position had *every* local item fail with `api.err.NoSiteContext` while cloud monitoring carried on working normally. [#6](../../issues/6) is exactly this case: a migration to self-hosted UniFi OS Server left the install with two sites, the redundant empty `default` one was removed, and the surviving site kept its generated name — the procedure set out in Ubiquiti's own community guide for changing the default site. New `{$UNIFI.API.SITE}` macro (default `default`) now carries it, propagated root host → console → device in the same way as the credentials and `{$UNIFI.LOCAL.PORT}`, so it is set once on the root host rather than per host. Note this is not specific to UniFi OS Server, nor to any particular version — it affects any install on any platform whose site is not named `default`.
+
+### Changed
+- **`{$UNIFI.API.URI}` now holds only the base path, `proxy/network/api/s`**, up to but not including the site. It previously held the full path including both the site and the trailing `/stat`. This change was unavoidable rather than chosen: Zabbix does not expand a user macro nested inside another user macro's value, so `proxy/network/api/s/{$UNIFI.API.SITE}/stat` would have been sent to the controller as literal text. The site therefore has to be composed at each of the twelve points where a URL is actually assembled. **If you overrode this macro before 1.7.0** — the only realistic reason being to work around this very bug — reset it to `proxy/network/api/s` and move your site name into `{$UNIFI.API.SITE}`.
+- **`{$UNIFI.API.REST.URI}` has been removed.** It only ever differed from `{$UNIFI.API.URI}` by its trailing `/rest` instead of `/stat`, which is now composed at the point of use. **If you overrode it**, move your site name into `{$UNIFI.API.SITE}`; there is no replacement macro and none is needed.
+- New README section, "Finding your site name", covering how to read your site's internal name from `/proxy/network/api/self/sites` and why it so often differs from the name shown in the interface.
+
 ## [1.6.0] - 2026-09-22
 
 Two unrelated live faults, plus the macro that should have existed all along for consoles that don't serve their API on port 443.

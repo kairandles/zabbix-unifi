@@ -29,7 +29,7 @@ zabbix_export:
 
       Template available at https://github.com/kairandles/zabbix-unifi
 
-      Version: 1.6.0
+      Version: 1.7.0
     groups:
     - name: Templates
     items:
@@ -96,6 +96,9 @@ zabbix_export:
         - macro: '{$SITENAME}'
           value: '{#SITENAME}'
           description: Site name derived from hostname - used for host group assignment
+        - macro: '{$UNIFI.API.SITE}'
+          value: '{#APISITE}'
+          description: UniFi site internal name, inherited from the root host's default at discovery time
         - macro: '{$UNIFI.LOCAL.PORT}'
           value: '{#LOCALPORT}'
           description: Local controller HTTPS port, inherited from the root host's default at discovery time
@@ -141,6 +144,8 @@ zabbix_export:
         path: $.localIp
       - lld_macro: '{#LOCALPORT}'
         path: $.localPort
+      - lld_macro: '{#APISITE}'
+        path: $.apiSite
       - lld_macro: '{#APIKEY}'
         path: $.apikey
       - lld_macro: '{#SITENAME}'
@@ -229,6 +234,7 @@ zabbix_export:
               obj[i].sessionRefreshInterval = '{$UNIFI.SESSION.REFRESH.INTERVAL}';
               obj[i].localApiEnabled = '{$UNIFI.LOCAL.API.ENABLED}';
               obj[i].localPort = '{$UNIFI.LOCAL.PORT}';
+              obj[i].apiSite = '{$UNIFI.API.SITE}';
               delete obj[i].reportedState.controllers;
               delete obj[i].features;
               delete obj[i].userData;
@@ -313,6 +319,11 @@ zabbix_export:
       value: '150'
       description: 'Latency threshold in ms for WARNING alert. Raise to 200+ for Central America sites where 60-80ms to UK
         is normal (default: 150)'
+    - macro: '{$UNIFI.API.SITE}'
+      value: default
+      description: 'Internal name of the UniFi site to poll, copied to every discovered console and device at
+        discovery time. Nearly every install calls its first site "default"; a hand-created site gets a generated ID
+        instead. Check yours at https://<console>/proxy/network/api/self/sites and use the "name" field.'
     - macro: '{$UNIFI.LOCAL.PORT}'
       value: '443'
       description: 'Local controller HTTPS port, copied to every discovered console and device at discovery time.
@@ -333,7 +344,7 @@ zabbix_export:
 
       Template available at https://github.com/kairandles/zabbix-unifi
 
-      Version: 1.6.0
+      Version: 1.7.0
     groups:
     - name: Templates
     items:
@@ -940,13 +951,13 @@ zabbix_export:
               function fetchAll(tok) {
                   var req = new HttpRequest();
                   req.addHeader('Cookie: {$UNIFI.API.AUTH.TOKEN}=' + tok);
-                  var health = req.get(base + '/{$UNIFI.API.URI}/health');
+                  var health = req.get(base + '/{$UNIFI.API.URI}/{$UNIFI.API.SITE}/stat/health');
                   if (req.getStatus() !== 200) throw 'health HTTP ' + req.getStatus();
                   req.addHeader('Cookie: {$UNIFI.API.AUTH.TOKEN}=' + tok);
-                  var device = req.get(base + '/{$UNIFI.API.URI}/device');
+                  var device = req.get(base + '/{$UNIFI.API.URI}/{$UNIFI.API.SITE}/stat/device');
                   if (req.getStatus() !== 200) throw 'device HTTP ' + req.getStatus();
                   req.addHeader('Cookie: {$UNIFI.API.AUTH.TOKEN}=' + tok);
-                  var shadow = req.get(base + '/{$UNIFI.API.REST.URI}/setting/shadow_mode');
+                  var shadow = req.get(base + '/{$UNIFI.API.URI}/{$UNIFI.API.SITE}/rest/setting/shadow_mode');
                   if (req.getStatus() !== 200) shadow = '{"data":[{}]}';
                   req.addHeader('Cookie: {$UNIFI.API.AUTH.TOKEN}=' + tok);
                   var system = req.get(base + '/api/system');
@@ -3995,6 +4006,9 @@ zabbix_export:
         - macro: '{$HOSTID}'
           value: '{#PARENTHOSTID}'
           description: Parent gateway host ID
+        - macro: '{$UNIFI.API.SITE}'
+          value: '{#APISITE}'
+          description: UniFi site internal name, inherited from the root host's default at discovery time
         - macro: '{$UNIFI.LOCAL.PORT}'
           value: '{#LOCALPORT}'
           description: Local controller HTTPS port, inherited from the root host's default at discovery time
@@ -4038,6 +4052,8 @@ zabbix_export:
         path: $.localIp
       - lld_macro: '{#LOCALPORT}'
         path: $.localPort
+      - lld_macro: '{#APISITE}'
+        path: $.apiSite
       - lld_macro: '{#DEVICEIP}'
         path: $.deviceIp
       - lld_macro: '{#USERNAME}'
@@ -4058,6 +4074,7 @@ zabbix_export:
           var hostId = '{$HOSTID}';
           var localIp = '{$UNIFI.LOCAL.IP}';
           var localPort = '{$UNIFI.LOCAL.PORT}';
+          var apiSite = '{$UNIFI.API.SITE}';
           var username = '{$UNIFI.USERNAME}';
           var password = '{$UNIFI.PASSWORD}';
           var token = d.token;
@@ -4072,6 +4089,7 @@ zabbix_export:
               devices[j].parentHostId = hostId;
               devices[j].localIp = localIp;
               devices[j].localPort = localPort;
+              devices[j].apiSite = apiSite;
               devices[j].username = username;
               devices[j].password = password;
               devices[j].sessionToken = token;
@@ -4127,6 +4145,9 @@ zabbix_export:
         - macro: '{$HOSTID}'
           value: '{#PARENTHOSTID}'
           description: Parent gateway host ID
+        - macro: '{$UNIFI.API.SITE}'
+          value: '{#APISITE}'
+          description: UniFi site internal name, inherited from the root host's default at discovery time
         - macro: '{$UNIFI.LOCAL.PORT}'
           value: '{#LOCALPORT}'
           description: Local controller HTTPS port, inherited from the root host's default at discovery time
@@ -4170,6 +4191,8 @@ zabbix_export:
         path: $.localIp
       - lld_macro: '{#LOCALPORT}'
         path: $.localPort
+      - lld_macro: '{#APISITE}'
+        path: $.apiSite
       - lld_macro: '{#DEVICEIP}'
         path: $.deviceIp
       - lld_macro: '{#USERNAME}'
@@ -4190,6 +4213,7 @@ zabbix_export:
           var hostId = '{$HOSTID}';
           var localIp = '{$UNIFI.LOCAL.IP}';
           var localPort = '{$UNIFI.LOCAL.PORT}';
+          var apiSite = '{$UNIFI.API.SITE}';
           var username = '{$UNIFI.USERNAME}';
           var password = '{$UNIFI.PASSWORD}';
           var token = d.token;
@@ -4204,6 +4228,7 @@ zabbix_export:
               devices[j].parentHostId = hostId;
               devices[j].localIp = localIp;
               devices[j].localPort = localPort;
+              devices[j].apiSite = apiSite;
               devices[j].username = username;
               devices[j].password = password;
               devices[j].sessionToken = token;
@@ -4259,6 +4284,9 @@ zabbix_export:
         - macro: '{$HOSTID}'
           value: '{#PARENTHOSTID}'
           description: Parent gateway host ID
+        - macro: '{$UNIFI.API.SITE}'
+          value: '{#APISITE}'
+          description: UniFi site internal name, inherited from the root host's default at discovery time
         - macro: '{$UNIFI.LOCAL.PORT}'
           value: '{#LOCALPORT}'
           description: Local controller HTTPS port, inherited from the root host's default at discovery time
@@ -4302,6 +4330,8 @@ zabbix_export:
         path: $.localIp
       - lld_macro: '{#LOCALPORT}'
         path: $.localPort
+      - lld_macro: '{#APISITE}'
+        path: $.apiSite
       - lld_macro: '{#DEVICEIP}'
         path: $.deviceIp
       - lld_macro: '{#USERNAME}'
@@ -4322,6 +4352,7 @@ zabbix_export:
           var hostId = '{$HOSTID}';
           var localIp = '{$UNIFI.LOCAL.IP}';
           var localPort = '{$UNIFI.LOCAL.PORT}';
+          var apiSite = '{$UNIFI.API.SITE}';
           var username = '{$UNIFI.USERNAME}';
           var password = '{$UNIFI.PASSWORD}';
           var token = d.token;
@@ -4336,6 +4367,7 @@ zabbix_export:
               devices[j].parentHostId = hostId;
               devices[j].localIp = localIp;
               devices[j].localPort = localPort;
+              devices[j].apiSite = apiSite;
               devices[j].username = username;
               devices[j].password = password;
               devices[j].sessionToken = token;
@@ -4391,6 +4423,9 @@ zabbix_export:
         - macro: '{$HOSTID}'
           value: '{#PARENTHOSTID}'
           description: Parent gateway host ID
+        - macro: '{$UNIFI.API.SITE}'
+          value: '{#APISITE}'
+          description: UniFi site internal name, inherited from the root host's default at discovery time
         - macro: '{$UNIFI.LOCAL.PORT}'
           value: '{#LOCALPORT}'
           description: Local controller HTTPS port, inherited from the root host's default at discovery time
@@ -4434,6 +4469,8 @@ zabbix_export:
         path: $.localIp
       - lld_macro: '{#LOCALPORT}'
         path: $.localPort
+      - lld_macro: '{#APISITE}'
+        path: $.apiSite
       - lld_macro: '{#DEVICEIP}'
         path: $.deviceIp
       - lld_macro: '{#USERNAME}'
@@ -4454,6 +4491,7 @@ zabbix_export:
           var hostId = '{$HOSTID}';
           var localIp = '{$UNIFI.LOCAL.IP}';
           var localPort = '{$UNIFI.LOCAL.PORT}';
+          var apiSite = '{$UNIFI.API.SITE}';
           var username = '{$UNIFI.USERNAME}';
           var password = '{$UNIFI.PASSWORD}';
           var token = d.token;
@@ -4468,6 +4506,7 @@ zabbix_export:
               devices[j].parentHostId = hostId;
               devices[j].localIp = localIp;
               devices[j].localPort = localPort;
+              devices[j].apiSite = apiSite;
               devices[j].username = username;
               devices[j].password = password;
               devices[j].sessionToken = token;
@@ -4537,6 +4576,9 @@ zabbix_export:
         - macro: '{$HOSTID}'
           value: '{#PARENTHOSTID}'
           description: Parent gateway host ID
+        - macro: '{$UNIFI.API.SITE}'
+          value: '{#APISITE}'
+          description: UniFi site internal name, inherited from the root host's default at discovery time
         - macro: '{$UNIFI.LOCAL.PORT}'
           value: '{#LOCALPORT}'
           description: Local controller HTTPS port, inherited from the root host's default at discovery time
@@ -4573,6 +4615,8 @@ zabbix_export:
         path: $.localIp
       - lld_macro: '{#LOCALPORT}'
         path: $.localPort
+      - lld_macro: '{#APISITE}'
+        path: $.apiSite
       - lld_macro: '{#DEVICEIP}'
         path: $.deviceIp
       - lld_macro: '{#USERNAME}'
@@ -4589,6 +4633,7 @@ zabbix_export:
           var hostId = '{$HOSTID}';
           var localIp = '{$UNIFI.LOCAL.IP}';
           var localPort = '{$UNIFI.LOCAL.PORT}';
+          var apiSite = '{$UNIFI.API.SITE}';
           var username = '{$UNIFI.USERNAME}';
           var password = '{$UNIFI.PASSWORD}';
           var rec = null;
@@ -4601,6 +4646,7 @@ zabbix_export:
               devices[j].parentHostId = hostId;
               devices[j].localIp = localIp;
               devices[j].localPort = localPort;
+              devices[j].apiSite = apiSite;
               devices[j].username = username;
               devices[j].password = password;
               devices[j].deviceIp = devices[j].ip || '';
@@ -5152,6 +5198,9 @@ zabbix_export:
         - macro: '{$HOSTID}'
           value: '{#PARENTHOSTID}'
           description: Parent gateway host ID
+        - macro: '{$UNIFI.API.SITE}'
+          value: '{#APISITE}'
+          description: UniFi site internal name, inherited from the root host's default at discovery time
         - macro: '{$UNIFI.LOCAL.PORT}'
           value: '{#LOCALPORT}'
           description: Local controller HTTPS port, inherited from the root host's default at discovery time
@@ -5191,6 +5240,8 @@ zabbix_export:
         path: $.localIp
       - lld_macro: '{#LOCALPORT}'
         path: $.localPort
+      - lld_macro: '{#APISITE}'
+        path: $.apiSite
       - lld_macro: '{#DEVICEIP}'
         path: $.deviceIp
       - lld_macro: '{#USERNAME}'
@@ -5211,6 +5262,7 @@ zabbix_export:
           var hostId = '{$HOSTID}';
           var localIp = '{$UNIFI.LOCAL.IP}';
           var localPort = '{$UNIFI.LOCAL.PORT}';
+          var apiSite = '{$UNIFI.API.SITE}';
           var username = '{$UNIFI.USERNAME}';
           var password = '{$UNIFI.PASSWORD}';
           var token = d.token;
@@ -5220,6 +5272,7 @@ zabbix_export:
               devices[j].parentHostId = hostId;
               devices[j].localIp = localIp;
               devices[j].localPort = localPort;
+              devices[j].apiSite = apiSite;
               devices[j].username = username;
               devices[j].password = password;
               devices[j].sessionToken = token;
@@ -5262,6 +5315,9 @@ zabbix_export:
         - macro: '{$HOSTID}'
           value: '{#PARENTHOSTID}'
           description: Parent gateway host ID
+        - macro: '{$UNIFI.API.SITE}'
+          value: '{#APISITE}'
+          description: UniFi site internal name, inherited from the root host's default at discovery time
         - macro: '{$UNIFI.LOCAL.PORT}'
           value: '{#LOCALPORT}'
           description: Local controller HTTPS port, inherited from the root host's default at discovery time
@@ -5301,6 +5357,8 @@ zabbix_export:
         path: $.localIp
       - lld_macro: '{#LOCALPORT}'
         path: $.localPort
+      - lld_macro: '{#APISITE}'
+        path: $.apiSite
       - lld_macro: '{#DEVICEIP}'
         path: $.deviceIp
       - lld_macro: '{#USERNAME}'
@@ -5321,6 +5379,7 @@ zabbix_export:
           var hostId = '{$HOSTID}';
           var localIp = '{$UNIFI.LOCAL.IP}';
           var localPort = '{$UNIFI.LOCAL.PORT}';
+          var apiSite = '{$UNIFI.API.SITE}';
           var username = '{$UNIFI.USERNAME}';
           var password = '{$UNIFI.PASSWORD}';
           var token = d.token;
@@ -5335,6 +5394,7 @@ zabbix_export:
               devices[j].parentHostId = hostId;
               devices[j].localIp = localIp;
               devices[j].localPort = localPort;
+              devices[j].apiSite = apiSite;
               devices[j].username = username;
               devices[j].password = password;
               devices[j].sessionToken = token;
@@ -5421,11 +5481,17 @@ zabbix_export:
       value: TOKEN
       description: Cookie token name returned by local controller login
     - macro: '{$UNIFI.API.URI}'
-      value: proxy/network/api/s/default/stat
-      description: Local controller stat endpoint base path
-    - macro: '{$UNIFI.API.REST.URI}'
-      value: proxy/network/api/s/default/rest
-      description: Local controller REST endpoint base path (settings, shadow_mode, etc.)
+      value: proxy/network/api/s
+      description: 'Local controller API base path, up to but NOT including the site. The site is set separately in
+        {$UNIFI.API.SITE}. Changed in 1.7.0: this macro previously held the full path including the site and the
+        trailing /stat - if you overrode it before 1.7.0, re-set it to just the base and move your site name into
+        {$UNIFI.API.SITE}.'
+    - macro: '{$UNIFI.API.SITE}'
+      value: default
+      description: 'Internal name of the UniFi site to poll, as it appears in the API path - NOT the label shown in
+        the UI. Nearly every install calls its first site "default", but a site created by hand gets a generated ID
+        such as "a1b2c3d4", and replacing the stock default site leaves that generated name in place. Check yours at
+        https://<console>/proxy/network/api/self/sites and use the "name" field, not "desc" or "_id".'
     - macro: '{$UNIFI.CPU.USAGE.WARN}'
       value: '80'
       description: CPU usage % WARNING threshold
@@ -5508,7 +5574,7 @@ zabbix_export:
       Applied to SD-WAN config hosts discovered by Ubiquiti UniFi API. Monitors tunnel health, configuration
       status, and WAN internet issues for each SD-WAN config via /v1/sd-wan-configs/{id}/status.
 
-      Version: 1.6.0
+      Version: 1.7.0
     groups:
     - name: Templates
     items:
@@ -5818,7 +5884,7 @@ zabbix_export:
       Monitors device status, firmware, version, uptime, and IP via cloud API.
       Macros {$HOSTID} and {$DEVICEID} are set automatically by the discovering gateway's host prototype.
 
-      Version: 1.6.0
+      Version: 1.7.0
 
       Template available at https://github.com/kairandles/zabbix-unifi
     groups:
@@ -6222,7 +6288,7 @@ zabbix_export:
       Local controller polling for UniFi Access Points. Applied alongside Ubiquiti UniFi Device by host
       prototype discovery.
 
-      Version: 1.6.0
+      Version: 1.7.0
     groups:
     - name: Templates
     items:
@@ -6234,7 +6300,7 @@ zabbix_export:
       history: 1h
       value_type: TEXT
       trends: '0'
-      url: https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/device
+      url: https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/{$UNIFI.API.SITE}/stat/device
       timeout: 10s
       headers:
       - name: Cookie
@@ -6270,7 +6336,7 @@ zabbix_export:
 
                   var dataReq = new HttpRequest();
                   dataReq.addHeader('Cookie: {$UNIFI.API.AUTH.TOKEN}=' + m[1]);
-                  var dataResp = dataReq.get('https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/device');
+                  var dataResp = dataReq.get('https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/{$UNIFI.API.SITE}/stat/device');
                   if (dataReq.getStatus() !== 200) throw 'fresh GET HTTP ' + dataReq.getStatus();
                   d = JSON.parse(dataResp);
                   if (!d || !Array.isArray(d.data)) throw 'fresh GET: unexpected response shape';
@@ -6772,7 +6838,17 @@ zabbix_export:
     - macro: '{$UNIFI.API.AUTH.TOKEN}'
       value: TOKEN
     - macro: '{$UNIFI.API.URI}'
-      value: proxy/network/api/s/default/stat
+      value: proxy/network/api/s
+      description: 'Local controller API base path, up to but NOT including the site. The site is set separately in
+        {$UNIFI.API.SITE}. Changed in 1.7.0: this macro previously held the full path including the site and the
+        trailing /stat - if you overrode it before 1.7.0, re-set it to just the base and move your site name into
+        {$UNIFI.API.SITE}.'
+    - macro: '{$UNIFI.API.SITE}'
+      value: default
+      description: 'Internal name of the UniFi site to poll, as it appears in the API path - NOT the label shown in
+        the UI. Nearly every install calls its first site "default", but a site created by hand gets a generated ID
+        such as "a1b2c3d4", and replacing the stock default site leaves that generated name in place. Check yours at
+        https://<console>/proxy/network/api/self/sites and use the "name" field, not "desc" or "_id".'
     - macro: '{$UNIFI.LOCAL.POLL.INTERVAL}'
       value: 10s
       description: How often this device polls the local controller directly - normally inherited from the console's
@@ -6806,7 +6882,7 @@ zabbix_export:
       Local controller polling for UniFi Switches. Applied alongside Ubiquiti UniFi Device by host prototype
       discovery.
 
-      Version: 1.6.0
+      Version: 1.7.0
     groups:
     - name: Templates
     items:
@@ -6818,7 +6894,7 @@ zabbix_export:
       history: 1h
       value_type: TEXT
       trends: '0'
-      url: https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/device
+      url: https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/{$UNIFI.API.SITE}/stat/device
       timeout: 10s
       headers:
       - name: Cookie
@@ -6854,7 +6930,7 @@ zabbix_export:
 
                   var dataReq = new HttpRequest();
                   dataReq.addHeader('Cookie: {$UNIFI.API.AUTH.TOKEN}=' + m[1]);
-                  var dataResp = dataReq.get('https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/device');
+                  var dataResp = dataReq.get('https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/{$UNIFI.API.SITE}/stat/device');
                   if (dataReq.getStatus() !== 200) throw 'fresh GET HTTP ' + dataReq.getStatus();
                   d = JSON.parse(dataResp);
                   if (!d || !Array.isArray(d.data)) throw 'fresh GET: unexpected response shape';
@@ -8080,7 +8156,17 @@ zabbix_export:
     - macro: '{$UNIFI.API.AUTH.TOKEN}'
       value: TOKEN
     - macro: '{$UNIFI.API.URI}'
-      value: proxy/network/api/s/default/stat
+      value: proxy/network/api/s
+      description: 'Local controller API base path, up to but NOT including the site. The site is set separately in
+        {$UNIFI.API.SITE}. Changed in 1.7.0: this macro previously held the full path including the site and the
+        trailing /stat - if you overrode it before 1.7.0, re-set it to just the base and move your site name into
+        {$UNIFI.API.SITE}.'
+    - macro: '{$UNIFI.API.SITE}'
+      value: default
+      description: 'Internal name of the UniFi site to poll, as it appears in the API path - NOT the label shown in
+        the UI. Nearly every install calls its first site "default", but a site created by hand gets a generated ID
+        such as "a1b2c3d4", and replacing the stock default site leaves that generated name in place. Check yours at
+        https://<console>/proxy/network/api/self/sites and use the "name" field, not "desc" or "_id".'
     - macro: '{$UNIFI.LOCAL.POLL.INTERVAL}'
       value: 10s
       description: How often this device polls the local controller directly - normally inherited from the console's
@@ -8142,7 +8228,7 @@ zabbix_export:
       Local controller polling for USW-Deployed-24 (USWDA) with battery backup. Applied alongside Ubiquiti
       UniFi Device by host prototype discovery.
 
-      Version: 1.6.0
+      Version: 1.7.0
     groups:
     - name: Templates
     items:
@@ -8154,7 +8240,7 @@ zabbix_export:
       history: 1h
       value_type: TEXT
       trends: '0'
-      url: https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/device
+      url: https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/{$UNIFI.API.SITE}/stat/device
       timeout: 10s
       headers:
       - name: Cookie
@@ -8190,7 +8276,7 @@ zabbix_export:
 
                   var dataReq = new HttpRequest();
                   dataReq.addHeader('Cookie: {$UNIFI.API.AUTH.TOKEN}=' + m[1]);
-                  var dataResp = dataReq.get('https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/device');
+                  var dataResp = dataReq.get('https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/{$UNIFI.API.SITE}/stat/device');
                   if (dataReq.getStatus() !== 200) throw 'fresh GET HTTP ' + dataReq.getStatus();
                   d = JSON.parse(dataResp);
                   if (!d || !Array.isArray(d.data)) throw 'fresh GET: unexpected response shape';
@@ -8503,7 +8589,17 @@ zabbix_export:
     - macro: '{$UNIFI.API.AUTH.TOKEN}'
       value: TOKEN
     - macro: '{$UNIFI.API.URI}'
-      value: proxy/network/api/s/default/stat
+      value: proxy/network/api/s
+      description: 'Local controller API base path, up to but NOT including the site. The site is set separately in
+        {$UNIFI.API.SITE}. Changed in 1.7.0: this macro previously held the full path including the site and the
+        trailing /stat - if you overrode it before 1.7.0, re-set it to just the base and move your site name into
+        {$UNIFI.API.SITE}.'
+    - macro: '{$UNIFI.API.SITE}'
+      value: default
+      description: 'Internal name of the UniFi site to poll, as it appears in the API path - NOT the label shown in
+        the UI. Nearly every install calls its first site "default", but a site created by hand gets a generated ID
+        such as "a1b2c3d4", and replacing the stock default site leaves that generated name in place. Check yours at
+        https://<console>/proxy/network/api/self/sites and use the "name" field, not "desc" or "_id".'
     - macro: '{$UNIFI.LOCAL.POLL.INTERVAL}'
       value: 10s
       description: How often this device polls the local controller directly - normally inherited from the console's
@@ -8546,7 +8642,7 @@ zabbix_export:
       Local controller polling for USP-RPS (Redundant Power Supply). Monitors PSU failover state - DISASTER
       fires when a connected device loses its primary PSU and the RPS takes over.
 
-      Version: 1.6.0
+      Version: 1.7.0
     groups:
     - name: Templates
     items:
@@ -8558,7 +8654,7 @@ zabbix_export:
       history: 1h
       value_type: TEXT
       trends: '0'
-      url: https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/device
+      url: https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/{$UNIFI.API.SITE}/stat/device
       timeout: 10s
       headers:
       - name: Cookie
@@ -8594,7 +8690,7 @@ zabbix_export:
 
                   var dataReq = new HttpRequest();
                   dataReq.addHeader('Cookie: {$UNIFI.API.AUTH.TOKEN}=' + m[1]);
-                  var dataResp = dataReq.get('https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/device');
+                  var dataResp = dataReq.get('https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/{$UNIFI.API.SITE}/stat/device');
                   if (dataReq.getStatus() !== 200) throw 'fresh GET HTTP ' + dataReq.getStatus();
                   d = JSON.parse(dataResp);
                   if (!d || !Array.isArray(d.data)) throw 'fresh GET: unexpected response shape';
@@ -9063,7 +9159,17 @@ zabbix_export:
     - macro: '{$UNIFI.API.AUTH.TOKEN}'
       value: TOKEN
     - macro: '{$UNIFI.API.URI}'
-      value: proxy/network/api/s/default/stat
+      value: proxy/network/api/s
+      description: 'Local controller API base path, up to but NOT including the site. The site is set separately in
+        {$UNIFI.API.SITE}. Changed in 1.7.0: this macro previously held the full path including the site and the
+        trailing /stat - if you overrode it before 1.7.0, re-set it to just the base and move your site name into
+        {$UNIFI.API.SITE}.'
+    - macro: '{$UNIFI.API.SITE}'
+      value: default
+      description: 'Internal name of the UniFi site to poll, as it appears in the API path - NOT the label shown in
+        the UI. Nearly every install calls its first site "default", but a site created by hand gets a generated ID
+        such as "a1b2c3d4", and replacing the stock default site leaves that generated name in place. Check yours at
+        https://<console>/proxy/network/api/self/sites and use the "name" field, not "desc" or "_id".'
     - macro: '{$UNIFI.LOCAL.POLL.INTERVAL}'
       value: 10s
       description: How often this device polls the local controller directly - normally inherited from the console's
@@ -9108,7 +9214,7 @@ zabbix_export:
       Protect Cameras" on Ubiquiti UniFi API Host. Reuses the same session token already cached by that console's
       unifi.host.session item - no separate login or credentials of its own.
 
-      Version: 1.6.0
+      Version: 1.7.0
     groups:
     - name: Templates
     items:
@@ -9571,7 +9677,7 @@ zabbix_export:
       types have no recording concept. Reuses the same session token already cached by that console's
       unifi.host.session item - no separate login or credentials of its own.
 
-      Version: 1.6.0
+      Version: 1.7.0
     groups:
     - name: Templates
     items:
