@@ -26,6 +26,7 @@ See [CHANGELOG.md](CHANGELOG.md) for what's changed between versions.
 - [WAN Alarm Suppression](#wan-alarm-suppression)
 - [Site Outage Alarm Suppression](#site-outage-alarm-suppression)
 - [High Availability (Shadow Mode)](#high-availability-shadow-mode)
+- [Large Sites](#large-sites)
 - [Troubleshooting](#troubleshooting)
 
 ---
@@ -114,7 +115,7 @@ Ubiquiti UniFi API          <- Assign this to a single Zabbix host
         +-------------------------------------------------------+
         |  Console host (1x per console, every 1m)               |
         |    GET /v1/hosts/{hostId}    -> unifi.api.hosts        |
-        |    GET /v1/devices?hostId=X  -> unifi.host.session |
+        |    GET /v1/devices?hostId=X  -> unifi.api.host.devices |
         |    GET /v1/sites?hostIds=X   -> unifi.api.host.sites   |
         +-------------------------------------------------------+
                                     |
@@ -124,6 +125,7 @@ Ubiquiti UniFi API          <- Assign this to a single Zabbix host
         +-------------------------------------------------------+
         |  Per-device host (Ubiquiti UniFi Device template)      |
         |    GET /v1/devices?hostId=X  -> unifi.api.device.raw   |
+        |    every {$UNIFI.CLOUD.POLL.INTERVAL}, default 1m       |
         +-------------------------------------------------------+
 
 
@@ -133,7 +135,6 @@ Ubiquiti UniFi API          <- Assign this to a single Zabbix host
         |  Console host (1x per console) - the ONLY thing that   |
         |  logs in under normal operation                        |
         |    POST /api/auth/login  (session token)                |
-        |    GET  /v1/devices?hostId=X  (cloud, as before)        |
         |      --> unifi.host.session                        |
         |    every {$UNIFI.SESSION.REFRESH.INTERVAL}, default 10m |
         +-------------------------------------------------------+
@@ -162,8 +163,10 @@ Ubiquiti UniFi API          <- Assign this to a single Zabbix host
                                     v
         +-------------------------------------------------------+
         |  Per-device host (UAP / USW / UPS / RPS template)      |
-        |    GET .../stat/device using the cached token - no      |
-        |    login, unless the token is rejected (see below)      |
+        |    GET .../stat/device/{mac} (this device only) using   |
+        |    the cached token - no login, unless the token is     |
+        |    rejected (see below); the full device table only     |
+        |    while this device is out of contact                  |
         |      --> unifi.uap.device / usw.device /                |
         |          ups.device / rps.device                        |
         |    every {$UNIFI.LOCAL.POLL.INTERVAL}, default 10s      |
@@ -184,13 +187,13 @@ Ubiquiti UniFi API          <- Assign this to a single Zabbix host
 
 Both consumers fall back to a one-off fresh login, just for that one poll, if their cached token is ever missing or rejected (console reboot, a missed refresh cycle) - self-healing immediately rather than waiting on the next scheduled refresh.
 
-`{$UNIFI.SESSION.REFRESH.INTERVAL}`'s `10m` default is deliberately conservative rather than cut close to the session token's ~2 hour lifetime: the login itself is cheap (O(1) per console regardless of device count), but the exact trigger for UniFi's local rate limiting isn't fully characterized - testing confirmed it's tripped by concurrent logins, but a rolling per-time-window limit hasn't been ruled out, so refreshing every 10 minutes rather than every 1 keeps total login attempts an order of magnitude lower for no real cost (still a 12x safety margin against the token's own expiry, and new/renamed devices - discovered via this same item's cloud fetch - just take up to 10 minutes to show up instead of 1).
+`{$UNIFI.SESSION.REFRESH.INTERVAL}`'s `10m` default is deliberately conservative rather than cut close to the session token's ~2 hour lifetime: the login itself is cheap (O(1) per console regardless of device count), but the exact trigger for UniFi's local rate limiting isn't fully characterized - testing confirmed it's tripped by concurrent logins, but a rolling per-time-window limit hasn't been ruled out, so refreshing every 10 minutes rather than every 1 keeps total login attempts an order of magnitude lower for no real cost (still a 12x safety margin against the token's own expiry, and new/renamed devices - picked up by `Device Discovery Source` on the same interval - just take up to 10 minutes to show up instead of 1).
 
 All three poll intervals - `{$UNIFI.LOCAL.POLL.INTERVAL}` (per-device), `{$UNIFI.CONSOLE.POLL.INTERVAL}` (`unifi.local.all`), and `{$UNIFI.SESSION.REFRESH.INTERVAL}` (`unifi.host.session`) - flow through the same chain as `{$UNIFI.USERNAME}`/`{$UNIFI.PASSWORD}`: one real default on the root `Ubiquiti UniFi API` template, propagated to every console, and for the per-device one, propagated again from each console to its devices - so any of them can be changed once at the root for everything, or overridden at the console or device level. Unlike the credential macros, every tier this passes through also keeps its own real fallback value (matching the ordinary threshold macros like `{$UNIFI.CPU.USAGE.WARN}`), not just the root: an empty *credential* just fails a login cleanly, but an empty polling *interval* is a hard Zabbix configuration error (`Invalid update interval ""`), so there's always something valid to fall back to for the brief window before a freshly-imported host's discovery chain has fully propagated a real value down to it.
 
 **UniFi Protect rides the same token.** UniFi Protect's local API (`/proxy/protect/api/bootstrap`) accepts the exact same session cookie as the Network API, as long as the account also has Protect permission granted in UniFi OS (a separate, one-time grant - see [Step 2](#2-prepare-local-controller-credentials)). A new `CALCULATED` item, `unifi.protect.bootstrap`, reads the cached token via `last(//unifi.host.session)` (identical mechanism to `unifi.local.all` above) and fetches the Protect bootstrap payload on its own schedule (`{$UNIFI.CONSOLE.POLL.INTERVAL}`) - no separate login, no new credentials. Every Protect camera and NVR-level item then derives from that one fetch, the same way Network devices derive from `unifi.local.all`/`unifi.host.session`. On a console that doesn't run Protect at all, this item detects the resulting 404 and reports an empty result rather than erroring - most consoles in a mixed fleet (pure Network/SD-WAN gateways) will simply show zero Protect hosts with no noise.
 
-**Known limitation: redundant cloud calls per device.** Every device host still fetches the cloud `/v1/devices` list itself (`unifi.api.device.raw`), even though its own console already pulled that exact data. This is a smaller-impact limitation than the local logins above - cloud API calls aren't subject to the same aggressive rate limiting UniFi applies to local logins, so it hasn't caused practical problems the way local logins did. The same structural blocker applies here, with one nuance: `CALCULATED` items *can* read another item's last value without polling it (that's exactly what `unifi.local.all` now does, above) - but only from a host they can name, and the only host-naming options are a literal hostname or an empty host slot meaning "myself." Neither works across the console→device boundary, since a device can't hardcode its own dynamically-discovered console's hostname, and "myself" isn't the console. `DEPENDENT` items have the same problem: the master must be on the same host. The only way to genuinely eliminate this one is turning per-device metrics into LLD item prototypes living on the console host instead of giving each device its own Zabbix host - a real architecture change, parked rather than attempted here.
+**Known limitation: redundant cloud calls per device.** Every device host still fetches the cloud `/v1/devices` list itself (`unifi.api.device.raw`), even though its own console already pulled that exact data. This is a smaller-impact limitation than the local logins above - cloud API calls aren't subject to the same aggressive rate limiting UniFi applies to local logins, so it hasn't caused practical problems the way local logins did. The same structural blocker applies here, with one nuance: `CALCULATED` items *can* read another item's last value without polling it (that's exactly what `unifi.local.all` now does, above) - but only from a host they can name, and the only host-naming options are a literal hostname or an empty host slot meaning "myself." Neither works across the console→device boundary, since a device can't hardcode its own dynamically-discovered console's hostname, and "myself" isn't the console. `DEPENDENT` items have the same problem: the master must be on the same host. The only way to genuinely eliminate this one is turning per-device metrics into LLD item prototypes living on the console host instead of giving each device its own Zabbix host - a real architecture change, parked rather than attempted here. Until then, `{$UNIFI.CLOUD.POLL.INTERVAL}` sets how often it happens - see [Large Sites](#large-sites).
 
 None of this causes bad alerting. A rate-limited or failed poll (local or cloud) is just skipped rather than misread as "offline" (see [Troubleshooting](#troubleshooting)).
 
@@ -347,8 +350,9 @@ Common optional overrides:
 | `{$UNIFI.USERNAME}` | *(empty)* | Default local controller username, propagated to every discovered console - see [Step 5](#5-configure-host-macros) |
 | `{$UNIFI.PASSWORD}` | *(secret)* | Default local controller password, propagated to every discovered console |
 | `{$UNIFI.LOCAL.POLL.INTERVAL}` | `10s` | Default per-device local poll interval, propagated to every discovered console and then on to every device - override at any tier (root, console, or device). Not a secret, so unlike username/password the real default lives directly on this template rather than requiring a root host override. Safe to poll this fast since no login is attached to this item (see [Polling Architecture](#polling-architecture)) - only the session-token refresh (`{$UNIFI.SESSION.REFRESH.INTERVAL}`, default 10m) actually logs in |
+| `{$UNIFI.CLOUD.POLL.INTERVAL}` | `1m` | Default per-device cloud poll interval (`unifi.api.device.raw`), propagated to every discovered console and then on to every device - override at any tier. Each poll fetches the console's whole device list, so on a site with hundreds of devices consider `2m`-`5m` - see [Large Sites](#large-sites) |
 | `{$UNIFI.CONSOLE.POLL.INTERVAL}` | `3m` | Default interval for each console's own combined local poll (`Local Raw (Combined)`, a `CALCULATED` item), propagated to every discovered console - override at the root or per-console. Safe to set much lower (e.g. `10s`) for fast WAN/health telemetry - this item doesn't log in itself, so its speed has no effect on login frequency (see [Polling Architecture](#polling-architecture)) |
-| `{$UNIFI.SESSION.REFRESH.INTERVAL}` | `10m` | Default interval for each console's session-token mint + cloud device fetch (`Local Session + Cloud Devices Raw`), propagated to every discovered console - override at the root or per-console. Deliberately conservative rather than cut close to the ~2 hour session token lifetime: the login is cheap either way, but UniFi's local rate limiter is only confirmed to trigger on concurrent logins, not proven safe against a sustained per-minute rate too, so this keeps total login attempts low regardless |
+| `{$UNIFI.SESSION.REFRESH.INTERVAL}` | `10m` | Default interval for each console's session-token mint (`Local Session Raw`) and device discovery refresh (`Device Discovery Source`), propagated to every discovered console - override at the root or per-console. Deliberately conservative rather than cut close to the ~2 hour session token lifetime: the login is cheap either way, but UniFi's local rate limiter is only confirmed to trigger on concurrent logins, not proven safe against a sustained per-minute rate too, so this keeps total login attempts low regardless |
 | `{$UNIFI.LOCAL.PORT}` | `443` | Local controller HTTPS port, propagated to every discovered console and then on to every device. `443` on UniFi OS consoles (UDM, CloudKey, UX); set this to `11443` for self-hosted UniFi OS Server. Override at any tier if a fleet is mixed |
 | `{$UNIFI.API.SITE}` | `default` | Internal name of the UniFi site to poll, propagated to every discovered console and device. See [Finding your site name](#finding-your-site-name) |
 | `{$WAN_UPTIME_WARN}` | `99` | Site-wide combined WAN uptime AVERAGE threshold (%) |
@@ -369,6 +373,7 @@ Common optional overrides:
 | `{$UNIFI.API.URI}` | `proxy/network/api/s` | Local API base path, up to but not including the site. Changed in 1.7.0 - it previously held the full path including the site |
 | `{$UNIFI.API.SITE}` | `default` | Internal name of the UniFi site to poll. See [Finding your site name](#finding-your-site-name) |
 | `{$UNIFI.LOCAL.POLL.INTERVAL}` | *(auto)* | Local poll interval - inherited from the root host's default at discovery time, or overridden here for every device on this console |
+| `{$UNIFI.CLOUD.POLL.INTERVAL}` | *(auto)* | Per-device cloud poll interval - inherited from the root host's default at discovery time, or overridden here for every device on this console (e.g. one large site) |
 | `{$UNIFI.CONSOLE.POLL.INTERVAL}` | *(auto)* | Console combined local poll interval - inherited from the root host's default at discovery time, or overridden here |
 | `{$UNIFI.SESSION.REFRESH.INTERVAL}` | *(auto)* | Session-token refresh interval - inherited from the root host's default at discovery time, or overridden here |
 | `{$HOSTID}` | *(auto)* | Console UUID from cloud - set by discovery |
@@ -398,6 +403,7 @@ Common optional overrides:
 | Macro | Default | Description |
 |-------|---------|-------------|
 | `{$UNIFI.UPTIME.WARN}` | `24` | Uptime warning threshold (hours) - alarms if uptime is below this after a reboot |
+| `{$UNIFI.CONTROLLER.WARMUP}` | `10m` | How long after the local Network application starts before a device it has not yet heard from counts as offline - see [Network Application Restarts](#network-application-restarts) |
 | `{$UNIFI.PORT.DROPPED.WINDOW}` | `5m` | Time window for the switch RX/TX dropped-packet rate check (USW only) |
 | `{$UNIFI.PORT.DROPPED.WARN}` | `1000` | Switch RX/TX dropped-packet count threshold within `{$UNIFI.PORT.DROPPED.WINDOW}` - starting default, tune to your own link's normal baseline (USW only) |
 | `{$UNIFI.CPU.USAGE.WARN}` | `80` | CPU warning (%) |
@@ -508,11 +514,11 @@ Two sets of WAN items are discovered per gateway:
 |-------|----------|-----------|
 | {WAN} availability is 0% (completely down) | HIGH | 24h availability = 0% and `{$UNIFI.WAN.ENABLED:{WAN}}=1` |
 | {WAN} physically unplugged | HIGH | Plugged = false for 3 consecutive checks and `{$UNIFI.WAN.ENABLED:{WAN}}=1` |
-| {WAN} sustained downtime (3/3 periods) | HIGH | All 3 of the most recent outage periods show downtime |
+| {WAN} sustained downtime (3/3 periods) | HIGH | Down in all 3 of the most recent reported 5-minute periods and `{$UNIFI.WAN.ENABLED:{WAN}}=1` |
 | {WAN} 24h availability degraded | AVERAGE | 24h availability < `{$WAN_UPTIME_WARN}`% (~14 min/day down) |
-| {WAN} intermittent downtime (2/3 periods) | AVERAGE | 2 of the last 3 outage periods show downtime |
+| {WAN} intermittent downtime (2/3 periods) | AVERAGE | Down in 2 of the 3 most recent reported 5-minute periods, not within 15 minutes of a sustained outage, and `{$UNIFI.WAN.ENABLED:{WAN}}=1` |
 | {WAN} 24h availability slightly below target | WARNING | 24h availability < `{$WAN_UPTIME_NOTICE}`% but ≥ `{$WAN_UPTIME_WARN}`% |
-| {WAN} packet loss in 2/3 recent periods | WARNING | Packet loss in 2 or more of the last 3 measurement periods |
+| {WAN} packet loss in 2/3 recent periods | WARNING | Packet loss in 2 or more of the 3 most recent reported 5-minute periods and `{$UNIFI.WAN.ENABLED:{WAN}}=1` |
 | {WAN} latency high | WARNING | 24h average latency > `{$UNIFI.WAN.LATENCY.WARN}` ms |
 | {WAN} administratively disabled | WARNING | WAN interface disabled in UniFi config |
 | {WAN} IPv4 address changed | WARNING | Local IPv4 address on this WAN changed |
@@ -572,8 +578,8 @@ The following alarms come from the **Ubiquiti UniFi UAP** template (local contro
 
 | Alarm | Severity | Fires when |
 |-------|----------|-----------|
-| Offline - not seen by local controller | HIGH | Device state ≠ 1 (alarms and clears on a single poll, no persistence window) |
-| Device offline (cloud) | HIGH | Cloud API reports the device offline while its console still reads online in the same payload - a real single-device failure, not a site-wide outage. Fires on the first offline sample, ~1 minute (see [Site Outage Alarm Suppression](#site-outage-alarm-suppression)) |
+| Offline - not seen by local controller | HIGH | The local controller is not in contact with the device (state is not connected, provisioning or upgrading), and its Network application has been running longer than `{$UNIFI.CONTROLLER.WARMUP}` (default 10m). Alarms on a single poll, no persistence window (see [Network Application Restarts](#network-application-restarts)) |
+| Device offline (cloud) | HIGH | Cloud API reports the device offline while its console still reads online in the same payload - a real single-device failure, not a site-wide outage. Fires on the first offline sample, ~1 minute. Held back while the local controller, where reachable, still sees the device or is starting up (see [Site Outage Alarm Suppression](#site-outage-alarm-suppression)) |
 | CPU usage critical | HIGH | CPU > `{$UNIFI.CPU.USAGE.HIGH}`% |
 | Memory usage critical | HIGH | Memory > `{$UNIFI.MEM.USAGE.HIGH}`% |
 | Radio not running | HIGH | Radio state is not RUN |
@@ -592,8 +598,8 @@ The following alarms come from the **Ubiquiti UniFi USW** template (local contro
 
 | Alarm | Severity | Fires when |
 |-------|----------|-----------|
-| Offline - not seen by local controller | HIGH | Device state ≠ 1 (alarms and clears on a single poll, no persistence window) |
-| Device offline (cloud) | HIGH | Cloud API reports the device offline while its console still reads online in the same payload - a real single-device failure, not a site-wide outage. Fires on the first offline sample, ~1 minute (see [Site Outage Alarm Suppression](#site-outage-alarm-suppression)) |
+| Offline - not seen by local controller | HIGH | The local controller is not in contact with the device (state is not connected, provisioning or upgrading), and its Network application has been running longer than `{$UNIFI.CONTROLLER.WARMUP}` (default 10m). Alarms on a single poll, no persistence window (see [Network Application Restarts](#network-application-restarts)) |
+| Device offline (cloud) | HIGH | Cloud API reports the device offline while its console still reads online in the same payload - a real single-device failure, not a site-wide outage. Fires on the first offline sample, ~1 minute. Held back while the local controller, where reachable, still sees the device or is starting up (see [Site Outage Alarm Suppression](#site-outage-alarm-suppression)) |
 | CPU usage critical | HIGH | CPU > `{$UNIFI.CPU.USAGE.HIGH}`% |
 | Memory usage critical | HIGH | Memory > `{$UNIFI.MEM.USAGE.HIGH}`% |
 | SFP TX fault active | HIGH | Module reports a transmit laser fault, likely a failed SFP or broken TX fibre |
@@ -632,8 +638,8 @@ The following alarms come from the **Ubiquiti UniFi UPS** template (local contro
 
 | Alarm | Severity | Fires when |
 |-------|----------|-----------|
-| Offline - not seen by local controller | HIGH | Device state ≠ 1 (alarms and clears on a single poll, no persistence window) |
-| Device offline (cloud) | HIGH | Cloud API reports the device offline while its console still reads online in the same payload - a real single-device failure, not a site-wide outage. Fires on the first offline sample, ~1 minute (see [Site Outage Alarm Suppression](#site-outage-alarm-suppression)) |
+| Offline - not seen by local controller | HIGH | The local controller is not in contact with the device (state is not connected, provisioning or upgrading), and its Network application has been running longer than `{$UNIFI.CONTROLLER.WARMUP}` (default 10m). Alarms on a single poll, no persistence window (see [Network Application Restarts](#network-application-restarts)) |
+| Device offline (cloud) | HIGH | Cloud API reports the device offline while its console still reads online in the same payload - a real single-device failure, not a site-wide outage. Fires on the first offline sample, ~1 minute. Held back while the local controller, where reachable, still sees the device or is starting up (see [Site Outage Alarm Suppression](#site-outage-alarm-suppression)) |
 | Battery level critical | HIGH | Battery < `{$UNIFI.UPS.BATTERY.HIGH}`% |
 | Battery runtime critical | HIGH | Remaining runtime < `{$UNIFI.UPS.RUNTIME.HIGH}` seconds |
 | Running on battery, mains power failed | HIGH | UPS is in battery mode |
@@ -656,8 +662,8 @@ The following alarms come from the **Ubiquiti UniFi RPS** template (local contro
 | RPS delivering 12V, connected device PSU failed | DISASTER | RPS is actively supplying 12V to a device |
 | RPS delivering 54V, connected device PSU failed | DISASTER | RPS is actively supplying 54V (PoE) to a device |
 | RPS port ACTIVE, primary PSU failed on connected device | DISASTER | RPS port has taken over from a failed PSU |
-| Offline - not seen by local controller | HIGH | Device state ≠ 1 (alarms and clears on a single poll, no persistence window) |
-| Device offline (cloud) | HIGH | Cloud API reports the device offline while its console still reads online in the same payload - a real single-device failure, not a site-wide outage. Fires on the first offline sample, ~1 minute (see [Site Outage Alarm Suppression](#site-outage-alarm-suppression)) |
+| Offline - not seen by local controller | HIGH | The local controller is not in contact with the device (state is not connected, provisioning or upgrading), and its Network application has been running longer than `{$UNIFI.CONTROLLER.WARMUP}` (default 10m). Alarms on a single poll, no persistence window (see [Network Application Restarts](#network-application-restarts)) |
+| Device offline (cloud) | HIGH | Cloud API reports the device offline while its console still reads online in the same payload - a real single-device failure, not a site-wide outage. Fires on the first offline sample, ~1 minute. Held back while the local controller, where reachable, still sees the device or is starting up (see [Site Outage Alarm Suppression](#site-outage-alarm-suppression)) |
 | Temperature critical | HIGH | Temp > `{$UNIFI.TEMP.HIGH}`°C |
 | Temperature high | WARNING | Temp > `{$UNIFI.TEMP.WARN}`°C |
 | RPS port disconnected, redundancy lost | WARNING | Port is not connected; device has no redundant power path |
@@ -726,11 +732,11 @@ Set this on the root host (**Data collection > Hosts > Ubiquiti UniFi API > Macr
 
 ## WAN Alarm Suppression
 
-For gateways where a WAN port is intentionally unused, set a host-level context macro to suppress both the unplugged and 0% uptime alarms for that WAN:
+For gateways where a WAN port is intentionally unused, set a host-level context macro to suppress the unplugged, availability, downtime-period and packet-loss-period alarms for that WAN:
 
 | Macro | Value | Effect |
 |-------|-------|--------|
-| `{$UNIFI.WAN.ENABLED:WAN2}` | `0` | Suppresses all WAN2 alarms (uptime and plugged) |
+| `{$UNIFI.WAN.ENABLED:WAN2}` | `0` | Suppresses all WAN2 alarms (plugged, availability, downtime and packet-loss periods) |
 | `{$UNIFI.WAN.ENABLED:WAN1}` | `0` | Suppresses all WAN1 alarms (not recommended on a primary) |
 | `{$UNIFI.WAN.ENABLED}` | `0` | Suppresses WAN alarms for all WANs on this host |
 
@@ -776,9 +782,20 @@ The templates treat "the cloud lost sight of the site" and "a device actually di
 - **Per-device "is offline" (cloud)** fires on a dedicated `Offline State` item whose preprocessing reads both the device's status *and* its console's status from the *same* `/v1/devices` payload (the console lists itself there with `isConsole: true`), and resolves them to one value: `0` = online, `1` = device offline while the console still reads online (a genuine single-device failure - alarm), `2` = device offline but the console is offline too (the cloud can't see the site at all, so per-device statuses are meaningless - stay silent). Because the distinction is made atomically inside one item from one payload, there is no cross-item or cross-host polling race and **no confirmation delay: a genuine failure alerts on the first offline sample (~1 minute)**, while a site outage or WAN failover - however brief - resolves to `2` and never alarms. A problem that was already open when the site went dark is held open rather than flap-closed (the trigger recovers only on state `0`), and a device that stays offline after the site comes back alerts within a poll cycle.
 - **Site-level offline counts** (offline devices / WiFi / wired / gateway, no-gateway) live on the console host itself, so they gate directly on the console's `Connection State` item, plus a two-consecutive-samples requirement (~2-3 minutes with the count items' 2m heartbeat) that closes the sub-minute race between the counts and the state item, which come from different master items on independent poll schedules. These are aggregate rollups - the per-device alarm above is the fast path.
 - **"Console lost cloud connectivity"** (DISASTER) only fires after the console has been disconnected for the whole of `{$UNIFI.CONSOLE.OFFLINE.GRACE}` (default `3m`), so a 1-2 minute WAN failover doesn't alarm at all. It recovers on the first `connected` sample.
-- **Local-controller polling** (per-device state, Protect cameras) needs no gating: when the site is unreachable the poll itself fails, the items go unsupported, and the triggers simply hold their last state.
+- **Local-controller polling** (per-device state, Protect cameras) needs no gating for a site outage: when the site is unreachable the poll itself fails, the items go unsupported, and the triggers simply hold their last state. Restarts of the controller itself are a different case, covered below.
 
 The net result for a sustained site outage is two meaningful alerts - the console DISASTER (after the grace period) plus whatever WAN/SD-WAN monitoring you have - instead of one per device. For a brief WAN failover, nothing fires.
+
+### Network Application Restarts
+
+A console's Network application can restart on its own, without the console rebooting or losing its internet connection. On startup it marks **every device disconnected** until each one checks back in, which can take from a few seconds to a couple of minutes per device. The cloud learns device status from the Network application and lags it by a minute or two, so it can go on reporting devices offline for several minutes after they have reconnected. The console's own cloud connection never drops, so the site-outage handling above doesn't apply. Without separate handling, one restart raises a "not seen by local controller" alarm for every device. Devices that are slow to check back in then get a cloud "is offline" alarm as well.
+
+Two pieces handle this:
+
+- **Local Offline State** (on each UAP / USW / UPS / RPS host) works out whether the Network application has only just started from the same `stat/device` poll that reports the device. On startup the application resets every device's connection state (`start_connected_millis` / `start_disconnected_millis`) at the same moment, so if even the longest-standing connection state across all devices is recent, the application has only just come up. A device the controller isn't in contact with resolves to `1` (alarm) normally, or `2` (silent) during the first `{$UNIFI.CONTROLLER.WARMUP}` (default `10m`) after startup. Provisioning and upgrading count as in contact, so pushing config to a device or upgrading its firmware doesn't raise "not seen by local controller" either. A genuine single-device failure still alarms on the first poll, because every other device's connection state stays old.
+- **Device offline (cloud)** is held back while that local view says the device is in contact or the application is starting up, via the `Offline Alarm Veto (Local)` item on `Ubiquiti UniFi Device`. The local view is only trusted if it has updated in the last 3 minutes. Hosts without one - "Other" devices with no device-type template, and consoles where local polling is disabled or failing - keep the cloud-only behaviour described above.
+
+A device that really is down when the application starts alarms once `{$UNIFI.CONTROLLER.WARMUP}` has passed. If the controller manages only one device (for example a CloudKey with a single access point), the startup check can't tell that device's own failure apart from a restart, so its alarm is delayed by the same amount.
 
 ---
 
@@ -792,6 +809,18 @@ For deployments using UniFi HA (two gateway units in Shadow Mode):
 - Trigger dependencies suppress downstream device alarms when the console itself goes offline
 
 No additional configuration is required - HA status is detected automatically from the local controller's Shadow Mode API.
+
+---
+
+## Large Sites
+
+Most of the per-device polling cost grows with the number of devices on a site, and some of it with the square of that number, because every device host makes its own requests. A site with a couple of dozen devices doesn't need any of this. From around a hundred devices per site it is worth a look:
+
+- **Local polling** (`{$UNIFI.LOCAL.POLL.INTERVAL}`, default `10s`). Each switch, AP, UPS and RPS host asks the local controller for its own record only (`stat/device/{mac}`), so the cost is linear in device count. The full device table is fetched only while a device is out of contact, because that is when [Local Offline State](#network-application-restarts) needs it - briefly for every device after a Network application restart, otherwise only for devices that are actually down. Raising this to `30s` or `60s` on the root host cuts both controller requests and history writes for every per-device item in proportion.
+- **Cloud polling** (`{$UNIFI.CLOUD.POLL.INTERVAL}`, default `1m`). Each device host fetches its console's whole device list from the cloud API (see the known limitation under [Polling Architecture](#polling-architecture)), so cloud traffic per console grows with the square of its device count. At 200 devices that is 200 requests a minute of roughly 100-150 KB each. That is well inside the documented Site Manager limit of 10,000 requests a minute, but `2m`-`5m` cuts it in proportion. The trade-off is slower cloud offline detection. Where Zabbix reaches the local controller, the local "not seen by local controller" alarm doesn't depend on this.
+- **Discovery and session refresh** (`{$UNIFI.SESSION.REFRESH.INTERVAL}`, default `10m`) cost one login and one cloud request per console per interval, regardless of device count.
+
+All three are set once on the root host and propagate to every console and device. Any of them can also be overridden on a single console's host, for one large site.
 
 ---
 
@@ -825,7 +854,7 @@ No additional configuration is required - HA status is detected automatically fr
 - Acknowledge and close the alarm in Zabbix once the underlying issue is resolved
 
 **HTTP 429 errors from the local controller**
-- Device hosts no longer log in themselves (see [Polling Architecture](#polling-architecture)), so this should be rare. The only thing that logs in under normal operation is `Local Session + Cloud Devices Raw` (`unifi.host.session`), on its own `{$UNIFI.SESSION.REFRESH.INTERVAL}` schedule (default 10m). `unifi.local.all` doesn't log in routinely at all - it only does a one-off fresh login itself if its cached token turns out to be rejected
+- Device hosts no longer log in themselves (see [Polling Architecture](#polling-architecture)), so this should be rare. The only things that log in under normal operation are `Local Session Raw` (`unifi.host.session`) and `Device Discovery Source` (`unifi.discover.devices.src`), once each per `{$UNIFI.SESSION.REFRESH.INTERVAL}` (default 10m). `unifi.local.all` doesn't log in routinely at all - it only does a one-off fresh login itself if its cached token turns out to be rejected
 - A rate-limited or failed poll is simply skipped rather than misread as the device being down, so an occasional `429` is not something you need to act on
 
 **`unifi.protect.bootstrap` reports HTTP 403**
@@ -839,4 +868,4 @@ No additional configuration is required - HA status is detected automatically fr
 
 **Camera or chime host also appears as a generic device under a console's inventory**
 - Protect devices are excluded from "Discover Host Other Devices" by their `productLine` field (`protect` vs `network`), confirmed against a live cloud API response before this was added. If you see a duplicate, check whether that specific device's `productLine` is actually reported as something other than `protect` - if so, it's worth reporting as an edge case, since every Protect device checked during development reported `protect` consistently regardless of type (camera, doorbell, chime)
-- If a device's cached `{$UNIFI.SESSION.TOKEN}` is ever rejected, that device performs one fresh login itself to recover the same cycle - a burst of these across many devices at once would point at the console-level token propagation being broken (check `Local Session + Cloud Devices Raw` under **Monitoring > Latest data**) rather than the per-device rate limit itself
+- If a device's cached `{$UNIFI.SESSION.TOKEN}` is ever rejected, that device performs one fresh login itself to recover the same cycle - a burst of these across many devices at once would point at the console-level token propagation being broken (check `Device Discovery Source` under **Monitoring > Latest data**, which mints the token devices are given) rather than the per-device rate limit itself
