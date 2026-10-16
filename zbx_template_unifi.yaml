@@ -29,7 +29,7 @@ zabbix_export:
 
       Template available at https://github.com/kairandles/zabbix-unifi
 
-      Version: 1.7.0
+      Version: 1.8.0
     groups:
     - name: Templates
     items:
@@ -119,6 +119,9 @@ zabbix_export:
         - macro: '{$UNIFI.LOCAL.POLL.INTERVAL}'
           value: '{#POLLINTERVAL}'
           description: Local poll interval, inherited from the root host's default at discovery time
+        - macro: '{$UNIFI.CLOUD.POLL.INTERVAL}'
+          value: '{#CLOUDPOLLINTERVAL}'
+          description: Per-device cloud poll interval, inherited from the root host's default at discovery time
         - macro: '{$UNIFI.CONSOLE.POLL.INTERVAL}'
           value: '{#CONSOLEPOLLINTERVAL}'
           description: Console combined local poll interval, inherited from the root host's default at discovery time
@@ -156,6 +159,8 @@ zabbix_export:
         path: $.password
       - lld_macro: '{#POLLINTERVAL}'
         path: $.pollInterval
+      - lld_macro: '{#CLOUDPOLLINTERVAL}'
+        path: $.cloudPollInterval
       - lld_macro: '{#CONSOLEPOLLINTERVAL}'
         path: $.consolePollInterval
       - lld_macro: '{#SESSIONREFRESHINTERVAL}'
@@ -230,6 +235,7 @@ zabbix_export:
               obj[i].username = '{$UNIFI.USERNAME}';
               obj[i].password = '{$UNIFI.PASSWORD}';
               obj[i].pollInterval = '{$UNIFI.LOCAL.POLL.INTERVAL}';
+              obj[i].cloudPollInterval = '{$UNIFI.CLOUD.POLL.INTERVAL}';
               obj[i].consolePollInterval = '{$UNIFI.CONSOLE.POLL.INTERVAL}';
               obj[i].sessionRefreshInterval = '{$UNIFI.SESSION.REFRESH.INTERVAL}';
               obj[i].localApiEnabled = '{$UNIFI.LOCAL.API.ENABLED}';
@@ -288,6 +294,14 @@ zabbix_export:
       description: Default per-device local poll interval, propagated to every discovered console and then on to every
         device, unless overridden at the console or device level. Not a secret, so (unlike username/password) the real
         default lives here on the template rather than requiring a root host override.
+    - macro: '{$UNIFI.CLOUD.POLL.INTERVAL}'
+      value: 1m
+      description: 'Default per-device cloud poll interval, propagated to every discovered console and then on to every
+        device, unless overridden at the console or device level. How often each device host polls the cloud API for its status (Ubiquiti UniFi Device). Every device
+        host fetches its whole console''s device list each time, so cloud traffic per console grows with the
+        square of its device count; on a site with hundreds of devices, raising this to 2m-5m cuts it in
+        proportion, at the cost of slower cloud offline detection. Where Zabbix can reach the local controller,
+        the local "not seen by local controller" alarm is unaffected.'
     - macro: '{$UNIFI.CONSOLE.POLL.INTERVAL}'
       value: 3m
       description: Default interval for the console's own combined local poll ("Local Raw (Combined)"), propagated to
@@ -344,7 +358,7 @@ zabbix_export:
 
       Template available at https://github.com/kairandles/zabbix-unifi
 
-      Version: 1.7.0
+      Version: 1.8.0
     groups:
     - name: Templates
     items:
@@ -813,19 +827,30 @@ zabbix_export:
       value_type: TEXT
       trends: '0'
       params: last(//unifi.api.host.devices)
-      description: 'Master item for the five Network device discovery rules. Carries the cloud device inventory (from
-        "Unifi API Raw: Host Devices", so discovery still works on a console with no local path) with a freshly minted
-        local session token attached, which the host prototypes hand to each device as {$UNIFI.SESSION.TOKEN}. The
-        token is best-effort: if the local login fails the device list is still returned with an empty token, so
-        discovery never blocks on local access. Refreshed on {$UNIFI.SESSION.REFRESH.INTERVAL} (default 10m), well
-        inside the ~2 hour token lifetime, and costs exactly one login per console per refresh.'
+      description: 'Master item for the five Network device discovery rules. Carries the cloud device inventory (fetched
+        from the cloud API, so discovery still works on a console with no local path) with a freshly minted local
+        session token attached, which the host prototypes hand to each device as {$UNIFI.SESSION.TOKEN}. The token is
+        best-effort: if the local login fails the device list is still returned with an empty token, so discovery
+        never blocks on local access. Refreshed on {$UNIFI.SESSION.REFRESH.INTERVAL} (default 10m), well inside the ~2
+        hour token lifetime, and costs exactly one login and one cloud request per console per refresh. The formula
+        only paces this item and holds it back until "Unifi API Raw: Host Devices" has answered at least once - its
+        value is not used, because last() returns the stored copy and Zabbix truncates stored text values at 64 KiB,
+        which the device list of a site with a couple of hundred devices exceeds.'
       preprocessing:
       - type: JAVASCRIPT
         parameters:
         - |
+          // Fetch the device list here rather than parsing value: value is the stored copy of
+          // "Unifi API Raw: Host Devices", and Zabbix truncates stored text values at 64 KiB,
+          // which a site with a couple of hundred devices exceeds.
           var cloud;
           try {
-              cloud = JSON.parse(value);
+              var creq = new HttpRequest();
+              creq.addHeader('Accept: application/json');
+              creq.addHeader('x-api-key: {$APIKEY}');
+              var body = creq.get('https://api.ui.com/v1/devices?hostId={$HOSTID}');
+              if (creq.getStatus() !== 200) throw 'HTTP ' + creq.getStatus();
+              cloud = JSON.parse(body);
           } catch (e) {
               throw 'cloud device list unavailable: ' + e;
           }
@@ -863,7 +888,7 @@ zabbix_export:
       - tag: component
         value: raw
     - uuid: 122dd6a2e28a4f22b897feb716fe026d
-      name: 'Local Session + Cloud Devices Raw'
+      name: 'Local Session Raw'
       type: HTTP_AGENT
       key: unifi.host.session
       delay: '{$UNIFI.SESSION.REFRESH.INTERVAL}'
@@ -878,6 +903,10 @@ zabbix_export:
       timeout: 15s
       verify_peer: 'NO'
       verify_host: 'NO'
+      description: 'Logs into the local controller every {$UNIFI.SESSION.REFRESH.INTERVAL} and stores the session token
+        as {"token": "..."}. Local Raw (Combined) and Protect Bootstrap Raw read it with last(), which sees the stored
+        copy, so this item deliberately carries nothing but the token: Zabbix truncates stored text values at 64 KiB,
+        and anything large enough to be cut off would take the token with it.'
       preprocessing:
       - type: REGEX
         parameters:
@@ -886,20 +915,7 @@ zabbix_export:
       - type: JAVASCRIPT
         parameters:
         - |
-          try {
-              var token = value;
-              var req = new HttpRequest();
-              req.addHeader('Accept: application/json');
-              req.addHeader('x-api-key: {$APIKEY}');
-              var resp = req.get('https://api.ui.com/v1/devices?hostId={$HOSTID}');
-              if (req.getStatus() !== 200) throw 'cloud HTTP ' + req.getStatus();
-              var cloud = JSON.parse(resp);
-              cloud.token = token;
-              return JSON.stringify(cloud);
-          } catch(e) {
-              Zabbix.log(4, '[UniFi host.session] ' + e);
-              throw e;
-          }
+          return JSON.stringify({token: value});
       tags:
       - tag: component
         value: raw
@@ -3804,6 +3820,10 @@ zabbix_export:
         type: DEPENDENT
         key: unifi.api.host.wan.downtimeCount[{#WANID}]
         delay: '0'
+        description: 'How many of the 3 most recent reported 5-minute periods had downtime on this WAN, from the
+          cloud''s 24-hour issue list. That list only includes periods that had an issue, grouping consecutive ones
+          into a single entry with a count, so the periods are counted rather than the entries. Periods the console did
+          not report at all are skipped.'
         preprocessing:
         - type: JSONPATH
           parameters:
@@ -3813,9 +3833,33 @@ zabbix_export:
         - type: JAVASCRIPT
           parameters:
           - |
+            // wanIssues lists only the 5-minute periods that had an issue. index is the period number (epoch / 300),
+            // count is the length of a run of consecutive periods (absent = 1), and an entry with no flags marks the
+            // period where issues ended. Count the periods flagged wanDowntime among the three most recent reported ones.
+            // A period is reported a few minutes after it closes, so start from the newest one listed, or two periods
+            // back if nothing newer is listed - anything up to there that is not listed had no issue. Periods the
+            // console did not report at all say nothing either way, so they are skipped rather than counted as clean.
             var arr = JSON.parse(value);
-            var recent = arr.slice(-3);
-            return recent.filter(function(i){return i.wanDowntime===true;}).length;
+            function has(p, flag) {
+                for (var j = 0; j < arr.length; j++) {
+                    if (arr[j][flag] === true && p >= arr[j].index && p < arr[j].index + (arr[j].count || 1)) return true;
+                }
+                return false;
+            }
+            var now = Math.floor(Date.now() / 300000);
+            var last = now - 2;
+            for (var i = 0; i < arr.length; i++) {
+                var end = arr[i].index + (arr[i].count || 1) - 1;
+                if (end > last && end < now) last = end;
+            }
+            var seen = 0;
+            var n = 0;
+            for (var p = last; p > last - 12 && seen < 3; p--) {
+                if (has(p, 'notReported')) continue;
+                seen++;
+                if (has(p, 'wanDowntime')) n++;
+            }
+            return n;
         - type: DISCARD_UNCHANGED_HEARTBEAT
           parameters:
           - 5m
@@ -3828,22 +3872,32 @@ zabbix_export:
           value: '{#WANID}'
         trigger_prototypes:
         - uuid: 194cfd2daabe416bbd29ec32f465a7b4
-          expression: last(/Ubiquiti UniFi API Host/unifi.api.host.wan.downtimeCount[{#WANID}])>=3
+          expression: last(/Ubiquiti UniFi API Host/unifi.api.host.wan.downtimeCount[{#WANID}])>=3 and
+            {$UNIFI.WAN.ENABLED:"{#WANID}"}=1
           name: '{#WANID} sustained downtime on {HOST.NAME} - {ITEM.LASTVALUE}/3 recent periods'
           priority: HIGH
-          description: '{#WANID} has been down in all 3 of the most recent measurement periods (~15-20 min). This circuit
-            is currently failing. Check physical connection and ISP status.'
+          description: '{#WANID} has been down in all 3 of the most recent reported 5-minute periods (~15 min). This
+            circuit is currently failing. Check physical connection and ISP status. To suppress for a WAN that is
+            intentionally offline on a specific host, set host macro {$UNIFI.WAN.ENABLED:WAN2}=0.'
         - uuid: 204339270a15409cbc7c85fd1e7dfa3a
-          expression: last(/Ubiquiti UniFi API Host/unifi.api.host.wan.downtimeCount[{#WANID}])=2
+          expression: last(/Ubiquiti UniFi API Host/unifi.api.host.wan.downtimeCount[{#WANID}])=2 and
+            max(/Ubiquiti UniFi API Host/unifi.api.host.wan.downtimeCount[{#WANID}],15m)<3 and
+            {$UNIFI.WAN.ENABLED:"{#WANID}"}=1
           name: '{#WANID} intermittent downtime on {HOST.NAME} - {ITEM.LASTVALUE}/3 recent periods'
           priority: AVERAGE
-          description: '{#WANID} experienced downtime in 2 of the last 3 measurement periods. Monitor for escalation. Check
-            ISP line quality.'
+          description: '{#WANID} was down in 2 of the 3 most recent reported 5-minute periods. Monitor for escalation and
+            check ISP line quality. Not raised within 15 minutes of a sustained outage, while the tail of that outage
+            still covers 2 of the 3 periods. To suppress for a WAN that is intentionally offline on a specific host, set
+            host macro {$UNIFI.WAN.ENABLED:WAN2}=0.'
       - uuid: ca89c956113d4379a089d588b4d762fa
         name: '{#WANID} Packet Loss Periods (recent)'
         type: DEPENDENT
         key: unifi.api.host.wan.packetLossCount[{#WANID}]
         delay: '0'
+        description: 'How many of the 3 most recent reported 5-minute periods had packet loss on this WAN, from the
+          cloud''s 24-hour issue list. That list only includes periods that had an issue, grouping consecutive ones
+          into a single entry with a count, so the periods are counted rather than the entries. Periods the console did
+          not report at all are skipped.'
         preprocessing:
         - type: JSONPATH
           parameters:
@@ -3853,9 +3907,33 @@ zabbix_export:
         - type: JAVASCRIPT
           parameters:
           - |
+            // wanIssues lists only the 5-minute periods that had an issue. index is the period number (epoch / 300),
+            // count is the length of a run of consecutive periods (absent = 1), and an entry with no flags marks the
+            // period where issues ended. Count the periods flagged packetLoss among the three most recent reported ones.
+            // A period is reported a few minutes after it closes, so start from the newest one listed, or two periods
+            // back if nothing newer is listed - anything up to there that is not listed had no issue. Periods the
+            // console did not report at all say nothing either way, so they are skipped rather than counted as clean.
             var arr = JSON.parse(value);
-            var recent = arr.slice(-3);
-            return recent.filter(function(i){return i.packetLoss===true;}).length;
+            function has(p, flag) {
+                for (var j = 0; j < arr.length; j++) {
+                    if (arr[j][flag] === true && p >= arr[j].index && p < arr[j].index + (arr[j].count || 1)) return true;
+                }
+                return false;
+            }
+            var now = Math.floor(Date.now() / 300000);
+            var last = now - 2;
+            for (var i = 0; i < arr.length; i++) {
+                var end = arr[i].index + (arr[i].count || 1) - 1;
+                if (end > last && end < now) last = end;
+            }
+            var seen = 0;
+            var n = 0;
+            for (var p = last; p > last - 12 && seen < 3; p--) {
+                if (has(p, 'notReported')) continue;
+                seen++;
+                if (has(p, 'packetLoss')) n++;
+            }
+            return n;
         - type: DISCARD_UNCHANGED_HEARTBEAT
           parameters:
           - 5m
@@ -3868,11 +3946,12 @@ zabbix_export:
           value: '{#WANID}'
         trigger_prototypes:
         - uuid: 2e912ce371ba439d8a66ca6bd9021ee2
-          expression: last(/Ubiquiti UniFi API Host/unifi.api.host.wan.packetLossCount[{#WANID}])>=2
+          expression: last(/Ubiquiti UniFi API Host/unifi.api.host.wan.packetLossCount[{#WANID}])>=2 and
+            {$UNIFI.WAN.ENABLED:"{#WANID}"}=1
           name: '{#WANID} packet loss in {ITEM.LASTVALUE}/3 recent periods on {HOST.NAME}'
           priority: WARNING
-          description: '{#WANID} has reported packet loss in 2 or more of the last 3 measurement periods. Line quality is
-            degraded. Check ISP status and cable integrity.'
+          description: '{#WANID} has reported packet loss in 2 or more of the 3 most recent reported 5-minute periods.
+            Line quality is degraded. Check ISP status and cable integrity.'
       - uuid: 7a5d1b0dda8f4134ab0adf4e8c6ff7ca
         name: '{#WANID} Latency'
         type: DEPENDENT
@@ -3988,6 +4067,9 @@ zabbix_export:
         - name: Ubiquiti UniFi Device
         - name: Ubiquiti UniFi UAP
         macros:
+        - macro: '{$UNIFI.CLOUD.POLL.INTERVAL}'
+          value: '{#CLOUDPOLLINTERVAL}'
+          description: Cloud device poll interval (inherited from gateway)
         - macro: '{$DEVICEID}'
           value: '{#DEVICEID}'
           description: Device cloud UUID
@@ -4034,6 +4116,8 @@ zabbix_export:
       master_item:
         key: unifi.discover.devices.src
       lld_macro_paths:
+      - lld_macro: '{#CLOUDPOLLINTERVAL}'
+        path: $.cloudPollInterval
       - lld_macro: '{#DEVICEID}'
         path: $.id
       - lld_macro: '{#DEVICEMAC}'
@@ -4095,6 +4179,9 @@ zabbix_export:
               devices[j].sessionToken = token;
               devices[j].pollInterval = pollInterval;
               devices[j].deviceIp = devices[j].ip || '';
+              // The cloud lists MACs as bare hex; the local controller's /stat/device/{mac} wants aa:bb:cc:dd:ee:ff
+              devices[j].mac = String(devices[j].mac || '').toLowerCase().replace(/[^0-9a-f]/g, '').replace(/(..)(?=.)/g, '$1:');
+              devices[j].cloudPollInterval = '{$UNIFI.CLOUD.POLL.INTERVAL}';
               devices[j].shortname = devices[j].shortname || devices[j].model || '';
               devices[j].siteName = '{$SITENAME}';
           }
@@ -4127,6 +4214,9 @@ zabbix_export:
         - name: Ubiquiti UniFi Device
         - name: Ubiquiti UniFi USW
         macros:
+        - macro: '{$UNIFI.CLOUD.POLL.INTERVAL}'
+          value: '{#CLOUDPOLLINTERVAL}'
+          description: Cloud device poll interval (inherited from gateway)
         - macro: '{$DEVICEID}'
           value: '{#DEVICEID}'
           description: Device cloud UUID
@@ -4173,6 +4263,8 @@ zabbix_export:
       master_item:
         key: unifi.discover.devices.src
       lld_macro_paths:
+      - lld_macro: '{#CLOUDPOLLINTERVAL}'
+        path: $.cloudPollInterval
       - lld_macro: '{#DEVICEID}'
         path: $.id
       - lld_macro: '{#DEVICEMAC}'
@@ -4234,6 +4326,9 @@ zabbix_export:
               devices[j].sessionToken = token;
               devices[j].pollInterval = pollInterval;
               devices[j].deviceIp = devices[j].ip || '';
+              // The cloud lists MACs as bare hex; the local controller's /stat/device/{mac} wants aa:bb:cc:dd:ee:ff
+              devices[j].mac = String(devices[j].mac || '').toLowerCase().replace(/[^0-9a-f]/g, '').replace(/(..)(?=.)/g, '$1:');
+              devices[j].cloudPollInterval = '{$UNIFI.CLOUD.POLL.INTERVAL}';
               devices[j].shortname = devices[j].shortname || devices[j].model || '';
               devices[j].siteName = '{$SITENAME}';
           }
@@ -4266,6 +4361,9 @@ zabbix_export:
         - name: Ubiquiti UniFi Device
         - name: Ubiquiti UniFi UPS
         macros:
+        - macro: '{$UNIFI.CLOUD.POLL.INTERVAL}'
+          value: '{#CLOUDPOLLINTERVAL}'
+          description: Cloud device poll interval (inherited from gateway)
         - macro: '{$DEVICEID}'
           value: '{#DEVICEID}'
           description: Device cloud UUID
@@ -4312,6 +4410,8 @@ zabbix_export:
       master_item:
         key: unifi.discover.devices.src
       lld_macro_paths:
+      - lld_macro: '{#CLOUDPOLLINTERVAL}'
+        path: $.cloudPollInterval
       - lld_macro: '{#DEVICEID}'
         path: $.id
       - lld_macro: '{#DEVICEMAC}'
@@ -4373,6 +4473,9 @@ zabbix_export:
               devices[j].sessionToken = token;
               devices[j].pollInterval = pollInterval;
               devices[j].deviceIp = devices[j].ip || '';
+              // The cloud lists MACs as bare hex; the local controller's /stat/device/{mac} wants aa:bb:cc:dd:ee:ff
+              devices[j].mac = String(devices[j].mac || '').toLowerCase().replace(/[^0-9a-f]/g, '').replace(/(..)(?=.)/g, '$1:');
+              devices[j].cloudPollInterval = '{$UNIFI.CLOUD.POLL.INTERVAL}';
               devices[j].shortname = devices[j].shortname || devices[j].model || '';
               devices[j].siteName = '{$SITENAME}';
           }
@@ -4405,6 +4508,9 @@ zabbix_export:
         - name: Ubiquiti UniFi Device
         - name: Ubiquiti UniFi RPS
         macros:
+        - macro: '{$UNIFI.CLOUD.POLL.INTERVAL}'
+          value: '{#CLOUDPOLLINTERVAL}'
+          description: Cloud device poll interval (inherited from gateway)
         - macro: '{$DEVICEID}'
           value: '{#DEVICEID}'
           description: Device cloud UUID
@@ -4451,6 +4557,8 @@ zabbix_export:
       master_item:
         key: unifi.discover.devices.src
       lld_macro_paths:
+      - lld_macro: '{#CLOUDPOLLINTERVAL}'
+        path: $.cloudPollInterval
       - lld_macro: '{#DEVICEID}'
         path: $.id
       - lld_macro: '{#DEVICEMAC}'
@@ -4512,6 +4620,9 @@ zabbix_export:
               devices[j].sessionToken = token;
               devices[j].pollInterval = pollInterval;
               devices[j].deviceIp = devices[j].ip || '';
+              // The cloud lists MACs as bare hex; the local controller's /stat/device/{mac} wants aa:bb:cc:dd:ee:ff
+              devices[j].mac = String(devices[j].mac || '').toLowerCase().replace(/[^0-9a-f]/g, '').replace(/(..)(?=.)/g, '$1:');
+              devices[j].cloudPollInterval = '{$UNIFI.CLOUD.POLL.INTERVAL}';
               devices[j].shortname = devices[j].shortname || devices[j].model || '';
               devices[j].siteName = '{$SITENAME}';
           }
@@ -4558,6 +4669,9 @@ zabbix_export:
         templates:
         - name: Ubiquiti UniFi Device
         macros:
+        - macro: '{$UNIFI.CLOUD.POLL.INTERVAL}'
+          value: '{#CLOUDPOLLINTERVAL}'
+          description: Cloud device poll interval (inherited from gateway)
         - macro: '{$DEVICEID}'
           value: '{#DEVICEID}'
           description: Device cloud UUID
@@ -4597,6 +4711,8 @@ zabbix_export:
       master_item:
         key: unifi.discover.devices.src
       lld_macro_paths:
+      - lld_macro: '{#CLOUDPOLLINTERVAL}'
+        path: $.cloudPollInterval
       - lld_macro: '{#DEVICEID}'
         path: $.id
       - lld_macro: '{#DEVICEMAC}'
@@ -4650,6 +4766,9 @@ zabbix_export:
               devices[j].username = username;
               devices[j].password = password;
               devices[j].deviceIp = devices[j].ip || '';
+              // The cloud lists MACs as bare hex; the local controller's /stat/device/{mac} wants aa:bb:cc:dd:ee:ff
+              devices[j].mac = String(devices[j].mac || '').toLowerCase().replace(/[^0-9a-f]/g, '').replace(/(..)(?=.)/g, '$1:');
+              devices[j].cloudPollInterval = '{$UNIFI.CLOUD.POLL.INTERVAL}';
               devices[j].shortname = devices[j].shortname || devices[j].model || '';
               devices[j].siteName = '{$SITENAME}';
           }
@@ -5443,8 +5562,8 @@ zabbix_export:
         Set to 0 on a console with no local network path from this Zabbix server (e.g. a cloud gateway with
         no local proxy) to skip local polling. This only stops network calls for "Local Raw (Combined)" and "Protect
         Bootstrap Raw" - both CALCULATED items where all HTTP calls happen in our own preprocessing, so we can check
-        this macro before making any request. It cannot stop "Local Session + Cloud Devices Raw" (the session-token
-        login POST) or the per-device local raw items (UAP/USW/UPS/RPS) from attempting their request: those are plain
+        this macro before making any request. It cannot stop "Local Session Raw" (the session-token login
+        POST) or the per-device local raw items (UAP/USW/UPS/RPS) from attempting their request: those are plain
         HTTP agent items whose request Zabbix fires before any preprocessing runs, so no template-side macro can gate
         them - they will keep trying and failing at whatever cadence {$UNIFI.LOCAL.POLL.INTERVAL} /
         {$UNIFI.SESSION.REFRESH.INTERVAL} / {$UNIFI.CONSOLE.POLL.INTERVAL} dictate. For a cloud-only console, raise
@@ -5463,6 +5582,11 @@ zabbix_export:
       description: Local poll interval - normally inherited from the root host's default at discovery time, or set here
         to override for every device on this specific console. This value is only a fallback for before the first discovery
         cycle populates the real one; not a secret, so (unlike username/password) it's safe to give it a real default here.
+    - macro: '{$UNIFI.CLOUD.POLL.INTERVAL}'
+      value: 1m
+      description: Per-device cloud poll interval - normally inherited from the root host's default at discovery time, or
+        set here to override for every device on this specific console. This value is only a fallback for before the
+        first discovery cycle populates the real one.
     - macro: '{$UNIFI.CONSOLE.POLL.INTERVAL}'
       value: 3m
       description: Console combined local poll interval ("Local Raw (Combined)") - normally inherited from the root host's
@@ -5540,7 +5664,7 @@ zabbix_export:
         (Latest data > this port's RX/TX Dropped item) if this fires too often or not sensitively enough.
     - macro: '{$UNIFI.WAN.ENABLED}'
       value: '1'
-      description: 'Controls both the unplugged and 0% uptime alarms for all WANs. Set context form {$UNIFI.WAN.ENABLED:WAN2}=0 on a host to suppress all alarms for that WAN (e.g. WAN2 not configured).'
+      description: 'Controls the unplugged, availability, downtime-period and packet-loss-period alarms for all WANs. Set context form {$UNIFI.WAN.ENABLED:WAN2}=0 on a host to suppress all alarms for that WAN (e.g. WAN2 not configured).'
     - macro: '{$UNIFI.WAN.ENABLED:WAN2}'
       value: '1'
       description: 'Default context for WAN2 - set to 0 on a host to suppress WAN2 unplugged and uptime alarms.'
@@ -5574,7 +5698,7 @@ zabbix_export:
       Applied to SD-WAN config hosts discovered by Ubiquiti UniFi API. Monitors tunnel health, configuration
       status, and WAN internet issues for each SD-WAN config via /v1/sd-wan-configs/{id}/status.
 
-      Version: 1.7.0
+      Version: 1.8.0
     groups:
     - name: Templates
     items:
@@ -5884,7 +6008,7 @@ zabbix_export:
       Monitors device status, firmware, version, uptime, and IP via cloud API.
       Macros {$HOSTID} and {$DEVICEID} are set automatically by the discovering gateway's host prototype.
 
-      Version: 1.7.0
+      Version: 1.8.0
 
       Template available at https://github.com/kairandles/zabbix-unifi
     groups:
@@ -5894,7 +6018,7 @@ zabbix_export:
       name: 'Unifi API Raw: Device'
       type: HTTP_AGENT
       key: unifi.api.device.raw
-      delay: 1m
+      delay: '{$UNIFI.CLOUD.POLL.INTERVAL}'
       history: 1h
       value_type: TEXT
       trends: '0'
@@ -5985,7 +6109,9 @@ zabbix_export:
         value: device
       triggers:
       - uuid: f7c0cd7ab5e1468a82727ab23d407f9c
-        expression: last(/Ubiquiti UniFi Device/unifi.api.device.offlineState)=1
+        expression: last(/Ubiquiti UniFi Device/unifi.api.device.offlineState)=1 and
+          (last(/Ubiquiti UniFi Device/unifi.device.localVeto)=0 or
+          nodata(/Ubiquiti UniFi Device/unifi.device.localVeto,3m)=1)
         recovery_mode: RECOVERY_EXPRESSION
         recovery_expression: last(/Ubiquiti UniFi Device/unifi.api.device.offlineState)=0
         name: '{HOST.NAME} is offline'
@@ -5996,7 +6122,10 @@ zabbix_export:
           sample (~1 minute), because the site-outage distinction is made atomically inside the Offline State item
           rather than by waiting for confirmation. While the whole site is dark (state 2) no new problem is raised, and
           an already-open problem is held open rather than flap-closed; a device that stays offline after the site comes
-          back alerts within a poll cycle.
+          back alerts within a poll cycle. Where Zabbix can reach the local controller, the alarm is also held back
+          while that controller still sees the device or its Network application is starting up (Offline Alarm Veto
+          item) - after an application restart the cloud goes on reporting reconnected devices offline for a few
+          minutes. Without a fresh local view this check is skipped.
     - uuid: f7b52deef83d41168b5d0b1a21ffbe2d
       name: Console Status
       type: DEPENDENT
@@ -6029,6 +6158,37 @@ zabbix_export:
         - 5m
       master_item:
         key: unifi.api.device.raw
+      tags:
+      - tag: component
+        value: device
+    - uuid: f96ef1432c1d4af6999ba373b5e458dd
+      name: Offline Alarm Veto (Local)
+      type: CALCULATED
+      key: unifi.device.localVeto
+      delay: 30s
+      history: 7d
+      trends: '0'
+      params: last(//unifi.local.offlineState)<>1 and count(//unifi.local.offlineState,3m)>0
+      description: 'Whether the local controller overrides a cloud "offline" reading for this device. 1 = the local
+        controller currently sees the device (connected, provisioning or upgrading), or its Network application has
+        only just started and has not heard back from every device yet. 0 = the local view agrees the device is
+        offline, or there is no usable local view. The cloud learns device status from the Network application and
+        lags it by a minute or two, so after the application restarts it can go on reporting devices offline that
+        have already reconnected. Read from the Local Offline State item that the device-type template (UAP, USW,
+        UPS or RPS) maintains from local polling, and only trusted if that item has updated within the last 3
+        minutes. Hosts with no local view - devices with no device-type template, or consoles whose local polling is
+        disabled or failing - read 0, so cloud offline alerting behaves exactly as it does without local access.'
+      preprocessing:
+      - type: CHECK_NOT_SUPPORTED
+        parameters:
+        - '-1'
+        error_handler: CUSTOM_VALUE
+        error_handler_params: '0'
+      - type: DISCARD_UNCHANGED_HEARTBEAT
+        parameters:
+        - 1m
+      valuemap:
+        name: Local veto
       tags:
       - tag: component
         value: device
@@ -6264,6 +6424,14 @@ zabbix_export:
       description: Device display name - set automatically by host prototype discovery
     - macro: '{$MODEL}'
       description: Device model - set automatically by host prototype discovery
+    - macro: '{$UNIFI.CLOUD.POLL.INTERVAL}'
+      value: 1m
+      description: 'Cloud poll interval for this device - normally inherited from its console at discovery time. This
+        value is only a fallback for before the first discovery cycle populates the real one. How often each device host polls the cloud API for its status (Ubiquiti UniFi Device). Every device
+        host fetches its whole console''s device list each time, so cloud traffic per console grows with the
+        square of its device count; on a site with hundreds of devices, raising this to 2m-5m cuts it in
+        proportion, at the cost of slower cloud offline detection. Where Zabbix can reach the local controller,
+        the local "not seen by local controller" alarm is unaffected.'
     valuemaps:
     - uuid: c0650fd02da44cc5a27e54cd4b5e895f
       name: Device offline state
@@ -6274,6 +6442,13 @@ zabbix_export:
         newvalue: Offline
       - value: '2'
         newvalue: 'Unknown - console offline'
+    - uuid: ad214acc33c74c659fb00ffb87d81eb2
+      name: Local veto
+      mappings:
+      - value: '0'
+        newvalue: 'No'
+      - value: '1'
+        newvalue: 'Yes - local controller sees device or is starting up'
     - uuid: 5995b8e5c09846538ef9b06abfa2ca6f
       name: Service state
       mappings:
@@ -6288,7 +6463,7 @@ zabbix_export:
       Local controller polling for UniFi Access Points. Applied alongside Ubiquiti UniFi Device by host
       prototype discovery.
 
-      Version: 1.7.0
+      Version: 1.8.0
     groups:
     - name: Templates
     items:
@@ -6300,7 +6475,7 @@ zabbix_export:
       history: 1h
       value_type: TEXT
       trends: '0'
-      url: https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/{$UNIFI.API.SITE}/stat/device
+      url: https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/{$UNIFI.API.SITE}/stat/device/{$DEVICEMAC}
       timeout: 10s
       headers:
       - name: Cookie
@@ -6314,6 +6489,8 @@ zabbix_export:
           try {
               var mac = '{$DEVICEMAC}';
               var macNorm = mac.replace(/:/g,'').toLowerCase();
+              var base = 'https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/{$UNIFI.API.SITE}';
+              var token = '{$UNIFI.SESSION.TOKEN}';
               var d;
 
               try {
@@ -6333,17 +6510,45 @@ zabbix_export:
                   for (var h in headers) { if (h.toLowerCase() === 'set-cookie') { setCookie = headers[h]; break; } }
                   var m = setCookie && setCookie.match(/{$UNIFI.API.AUTH.TOKEN}=([^;]+);/);
                   if (!m) throw 'fresh login: no token in response headers';
+                  token = m[1];
 
                   var dataReq = new HttpRequest();
-                  dataReq.addHeader('Cookie: {$UNIFI.API.AUTH.TOKEN}=' + m[1]);
-                  var dataResp = dataReq.get('https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/{$UNIFI.API.SITE}/stat/device');
+                  dataReq.addHeader('Cookie: {$UNIFI.API.AUTH.TOKEN}=' + token);
+                  var dataResp = dataReq.get(base + '/stat/device/' + mac);
                   if (dataReq.getStatus() !== 200) throw 'fresh GET HTTP ' + dataReq.getStatus();
                   d = JSON.parse(dataResp);
                   if (!d || !Array.isArray(d.data)) throw 'fresh GET: unexpected response shape';
               }
 
-              var dev = d.data.filter(function(x) { return x.mac && x.mac.replace(/:/g,'').toLowerCase() === macNorm; });
-              return JSON.stringify({data: dev});
+              function mine(list) {
+                  return list.filter(function(x) { return x.mac && x.mac.replace(/:/g,'').toLowerCase() === macNorm; });
+              }
+              var dev = mine(d.data);
+              var state = dev.length ? dev[0].state : 0;
+              var since = null;
+              // The poll asks for this device alone. The full device table is fetched only when the device is not in
+              // contact (connected, upgrading or provisioning) or was not returned at all, because Local Offline State
+              // then needs it to tell a restart of the Network application apart from a fault on this device.
+              if (state !== 1 && state !== 4 && state !== 5) {
+                  try {
+                      var allReq = new HttpRequest();
+                      allReq.addHeader('Cookie: {$UNIFI.API.AUTH.TOKEN}=' + token);
+                      var allResp = allReq.get(base + '/stat/device');
+                      if (allReq.getStatus() !== 200) throw 'HTTP ' + allReq.getStatus();
+                      var all = JSON.parse(allResp).data;
+                      if (!dev.length) dev = mine(all);
+                      // On startup the Network application resets every device's connection state at the same moment,
+                      // so the oldest current connection state across all devices tells how long it has been running.
+                      for (var i = 0; i < all.length; i++) {
+                          if (all[i].adopted === false) continue;
+                          var t = Math.max(all[i].start_connected_millis || 0, all[i].start_disconnected_millis || 0);
+                          if (t > 0 && (since === null || t < since)) since = t;
+                      }
+                  } catch (e) {
+                      Zabbix.log(4, '[UniFi UAP] full device table unavailable (' + e + ')');
+                  }
+              }
+              return JSON.stringify({data: dev, controllerSince: since});
           } catch(e) {
               Zabbix.log(4, '[UniFi UAP] ' + e);
               throw e;
@@ -6371,19 +6576,63 @@ zabbix_export:
       tags:
       - tag: component
         value: uap
+    - uuid: 3eda198ad76d4bfb810ec5ff722faf60
+      name: Local Offline State
+      type: DEPENDENT
+      key: unifi.local.offlineState
+      delay: '0'
+      history: 90d
+      trends: '0'
+      description: 'Alert-ready offline state computed from the local controller''s device table. 0 = seen (state 1
+        connected, 4 upgrading or 5 provisioning - the controller is in contact with the device). 1 = not seen, and
+        the Network application has been running for longer than {$UNIFI.CONTROLLER.WARMUP}. 2 = not seen, but the
+        Network application started less than {$UNIFI.CONTROLLER.WARMUP} ago. On startup the application marks every
+        device disconnected until each one checks back in, which can take a few minutes per device, so a device it
+        has not heard from yet is not evidence of a fault. The start time comes from the same poll: the application
+        resets every device''s connection state at the same moment, so if even the longest-standing connection state
+        across all devices is recent, the application has only just come up.'
+      preprocessing:
+      - type: JAVASCRIPT
+        parameters:
+        - |
+          var d = JSON.parse(value);
+          var dev = (d.data || [])[0];
+          var state = dev ? dev.state : 0;
+          // 1 connected, 4 upgrading, 5 provisioning: the controller is in contact with the device
+          if (state === 1 || state === 4 || state === 5) return 0;
+          var w = String('{$UNIFI.CONTROLLER.WARMUP}').match(/^(\d+)([smh]?)$/);
+          var unit = {s: 1, m: 60, h: 3600};
+          var warmupMs = w ? w[1] * unit[w[2] || 's'] * 1000 : 600000;
+          if (d.controllerSince && Date.now() - d.controllerSince < warmupMs) return 2;
+          return 1;
+      - type: DISCARD_UNCHANGED_HEARTBEAT
+        parameters:
+        - 1m
+      master_item:
+        key: unifi.uap.device
+      valuemap:
+        name: Local offline state
+      tags:
+      - tag: component
+        value: uap
       triggers:
       - uuid: a284c526cefe4d14bb5ad82ef30b416d
-        expression: last(/Ubiquiti UniFi UAP/unifi.uap.state)<>1
+        expression: last(/Ubiquiti UniFi UAP/unifi.local.offlineState)=1
         recovery_mode: RECOVERY_EXPRESSION
-        recovery_expression: last(/Ubiquiti UniFi UAP/unifi.uap.state)=1
+        recovery_expression: last(/Ubiquiti UniFi UAP/unifi.local.offlineState)=0
         name: '{HOST.NAME} offline - not seen by local controller'
         priority: HIGH
-        description: The local UniFi controller is reporting this device as offline (state ≠ 1). The device may have 
-          lost power, its uplink connection, or the controller has lost management reachability. This trigger is 
-          suppressed if the cloud API is also reporting the device offline, to prevent duplicate alerts.
+        description: The local UniFi controller is not in contact with this device (it is not connected, provisioning
+          or upgrading) and its Network application has been running for longer than {$UNIFI.CONTROLLER.WARMUP}. The
+          device may have lost power or its uplink, or the controller has lost management reachability. Not raised
+          while the application is starting up, when it reports every device disconnected until each checks back in.
+          An already-open problem is held open through a controller restart. Suppressed if the cloud API is already
+          reporting the device offline, to prevent duplicate alerts.
         dependencies:
         - name: '{HOST.NAME} is offline'
-          expression: last(/Ubiquiti UniFi Device/unifi.api.device.offlineState)=1
+          expression: last(/Ubiquiti UniFi Device/unifi.api.device.offlineState)=1 and
+            (last(/Ubiquiti UniFi Device/unifi.device.localVeto)=0 or
+            nodata(/Ubiquiti UniFi Device/unifi.device.localVeto,3m)=1)
           recovery_expression: last(/Ubiquiti UniFi Device/unifi.api.device.offlineState)=0
     - uuid: 786d50d6e6c740c2ab29f35a05b7a3fb
       name: CPU Usage
@@ -6717,8 +6966,8 @@ zabbix_export:
           priority: HIGH
           dependencies:
           - name: '{HOST.NAME} offline - not seen by local controller'
-            expression: last(/Ubiquiti UniFi UAP/unifi.uap.state)<>1
-            recovery_expression: last(/Ubiquiti UniFi UAP/unifi.uap.state)=1
+            expression: last(/Ubiquiti UniFi UAP/unifi.local.offlineState)=1
+            recovery_expression: last(/Ubiquiti UniFi UAP/unifi.local.offlineState)=0
           description: The {#RADIONAME} radio on this access point is not in a running state. Clients on this frequency 
             band will be unable to connect to this AP. A reboot usually recovers a stuck radio; if the issue recurs, the
             AP may need a firmware update or hardware replacement.
@@ -6875,6 +7124,22 @@ zabbix_export:
     - macro: '{$UNIFI.UPTIME.WARN}'
       value: '24'
       description: Uptime warning threshold (hours). Fire if uptime < this value × 3600 seconds - default 24h.
+    - macro: '{$UNIFI.CONTROLLER.WARMUP}'
+      value: 10m
+      description: 'How long after the local Network application starts before a device it has not yet heard from
+        counts as offline. On startup the application marks every device disconnected until each one checks back
+        in, which can take a few minutes; a device that is genuinely down when the application starts alerts once
+        this has elapsed. Seconds, or a value with an s, m or h suffix.'
+    valuemaps:
+    - uuid: 270acb03c21f45d2b5ee33920461f020
+      name: Local offline state
+      mappings:
+      - value: '0'
+        newvalue: Seen
+      - value: '1'
+        newvalue: Not seen
+      - value: '2'
+        newvalue: 'Not seen - controller starting up'
   - uuid: ae887645c1f94cf7a5bcc02a5110494d
     template: Ubiquiti UniFi USW
     name: Ubiquiti UniFi USW
@@ -6882,7 +7147,7 @@ zabbix_export:
       Local controller polling for UniFi Switches. Applied alongside Ubiquiti UniFi Device by host prototype
       discovery.
 
-      Version: 1.7.0
+      Version: 1.8.0
     groups:
     - name: Templates
     items:
@@ -6894,7 +7159,7 @@ zabbix_export:
       history: 1h
       value_type: TEXT
       trends: '0'
-      url: https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/{$UNIFI.API.SITE}/stat/device
+      url: https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/{$UNIFI.API.SITE}/stat/device/{$DEVICEMAC}
       timeout: 10s
       headers:
       - name: Cookie
@@ -6908,6 +7173,8 @@ zabbix_export:
           try {
               var mac = '{$DEVICEMAC}';
               var macNorm = mac.replace(/:/g,'').toLowerCase();
+              var base = 'https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/{$UNIFI.API.SITE}';
+              var token = '{$UNIFI.SESSION.TOKEN}';
               var d;
 
               try {
@@ -6927,17 +7194,45 @@ zabbix_export:
                   for (var h in headers) { if (h.toLowerCase() === 'set-cookie') { setCookie = headers[h]; break; } }
                   var m = setCookie && setCookie.match(/{$UNIFI.API.AUTH.TOKEN}=([^;]+);/);
                   if (!m) throw 'fresh login: no token in response headers';
+                  token = m[1];
 
                   var dataReq = new HttpRequest();
-                  dataReq.addHeader('Cookie: {$UNIFI.API.AUTH.TOKEN}=' + m[1]);
-                  var dataResp = dataReq.get('https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/{$UNIFI.API.SITE}/stat/device');
+                  dataReq.addHeader('Cookie: {$UNIFI.API.AUTH.TOKEN}=' + token);
+                  var dataResp = dataReq.get(base + '/stat/device/' + mac);
                   if (dataReq.getStatus() !== 200) throw 'fresh GET HTTP ' + dataReq.getStatus();
                   d = JSON.parse(dataResp);
                   if (!d || !Array.isArray(d.data)) throw 'fresh GET: unexpected response shape';
               }
 
-              var dev = d.data.filter(function(x) { return x.mac && x.mac.replace(/:/g,'').toLowerCase() === macNorm; });
-              return JSON.stringify({data: dev});
+              function mine(list) {
+                  return list.filter(function(x) { return x.mac && x.mac.replace(/:/g,'').toLowerCase() === macNorm; });
+              }
+              var dev = mine(d.data);
+              var state = dev.length ? dev[0].state : 0;
+              var since = null;
+              // The poll asks for this device alone. The full device table is fetched only when the device is not in
+              // contact (connected, upgrading or provisioning) or was not returned at all, because Local Offline State
+              // then needs it to tell a restart of the Network application apart from a fault on this device.
+              if (state !== 1 && state !== 4 && state !== 5) {
+                  try {
+                      var allReq = new HttpRequest();
+                      allReq.addHeader('Cookie: {$UNIFI.API.AUTH.TOKEN}=' + token);
+                      var allResp = allReq.get(base + '/stat/device');
+                      if (allReq.getStatus() !== 200) throw 'HTTP ' + allReq.getStatus();
+                      var all = JSON.parse(allResp).data;
+                      if (!dev.length) dev = mine(all);
+                      // On startup the Network application resets every device's connection state at the same moment,
+                      // so the oldest current connection state across all devices tells how long it has been running.
+                      for (var i = 0; i < all.length; i++) {
+                          if (all[i].adopted === false) continue;
+                          var t = Math.max(all[i].start_connected_millis || 0, all[i].start_disconnected_millis || 0);
+                          if (t > 0 && (since === null || t < since)) since = t;
+                      }
+                  } catch (e) {
+                      Zabbix.log(4, '[UniFi USW] full device table unavailable (' + e + ')');
+                  }
+              }
+              return JSON.stringify({data: dev, controllerSince: since});
           } catch(e) {
               Zabbix.log(4, '[UniFi USW] ' + e);
               throw e;
@@ -6965,20 +7260,64 @@ zabbix_export:
       tags:
       - tag: component
         value: usw
+    - uuid: c0dd7a02b6b247c2b1ee969fe0fe6eaf
+      name: Local Offline State
+      type: DEPENDENT
+      key: unifi.local.offlineState
+      delay: '0'
+      history: 90d
+      trends: '0'
+      description: 'Alert-ready offline state computed from the local controller''s device table. 0 = seen (state 1
+        connected, 4 upgrading or 5 provisioning - the controller is in contact with the device). 1 = not seen, and
+        the Network application has been running for longer than {$UNIFI.CONTROLLER.WARMUP}. 2 = not seen, but the
+        Network application started less than {$UNIFI.CONTROLLER.WARMUP} ago. On startup the application marks every
+        device disconnected until each one checks back in, which can take a few minutes per device, so a device it
+        has not heard from yet is not evidence of a fault. The start time comes from the same poll: the application
+        resets every device''s connection state at the same moment, so if even the longest-standing connection state
+        across all devices is recent, the application has only just come up.'
+      preprocessing:
+      - type: JAVASCRIPT
+        parameters:
+        - |
+          var d = JSON.parse(value);
+          var dev = (d.data || [])[0];
+          var state = dev ? dev.state : 0;
+          // 1 connected, 4 upgrading, 5 provisioning: the controller is in contact with the device
+          if (state === 1 || state === 4 || state === 5) return 0;
+          var w = String('{$UNIFI.CONTROLLER.WARMUP}').match(/^(\d+)([smh]?)$/);
+          var unit = {s: 1, m: 60, h: 3600};
+          var warmupMs = w ? w[1] * unit[w[2] || 's'] * 1000 : 600000;
+          if (d.controllerSince && Date.now() - d.controllerSince < warmupMs) return 2;
+          return 1;
+      - type: DISCARD_UNCHANGED_HEARTBEAT
+        parameters:
+        - 1m
+      master_item:
+        key: unifi.usw.device
+      valuemap:
+        name: Local offline state
+      tags:
+      - tag: component
+        value: usw
       triggers:
       - uuid: bbe2ee3a0ab34a9b8e7944f5ee31781c
-        expression: last(/Ubiquiti UniFi USW/unifi.usw.state)<>1
+        expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=1
         recovery_mode: RECOVERY_EXPRESSION
-        recovery_expression: last(/Ubiquiti UniFi USW/unifi.usw.state)=1
+        recovery_expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=0
         name: '{HOST.NAME} offline - not seen by local controller'
         priority: HIGH
+        description: The local UniFi controller is not in contact with this device (it is not connected, provisioning
+          or upgrading) and its Network application has been running for longer than {$UNIFI.CONTROLLER.WARMUP}. The
+          device may have lost power or its uplink, or the controller has lost management reachability. Not raised
+          while the application is starting up, when it reports every device disconnected until each checks back in.
+          An already-open problem is held open through a controller restart. Suppressed if the cloud API is already
+          reporting the device offline, to prevent duplicate alerts.
         dependencies:
         - name: '{HOST.NAME} is offline'
-          expression: last(/Ubiquiti UniFi Device/unifi.api.device.offlineState)=1
+          expression: last(/Ubiquiti UniFi Device/unifi.api.device.offlineState)=1 and
+            (last(/Ubiquiti UniFi Device/unifi.device.localVeto)=0 or
+            nodata(/Ubiquiti UniFi Device/unifi.device.localVeto,3m)=1)
           recovery_expression: last(/Ubiquiti UniFi Device/unifi.api.device.offlineState)=0
-        description: The local UniFi controller is reporting this device as offline (state ≠ 1). The device may have 
-          lost power, its uplink connection, or the controller has lost management reachability. This trigger is 
-          suppressed if the cloud API is also reporting the device offline, to prevent duplicate alerts.
     - uuid: c08c59cba2af4b268ecc80214be1e31e
       name: CPU Usage
       type: DEPENDENT
@@ -7180,8 +7519,8 @@ zabbix_export:
           manual_close: 'YES'
           dependencies:
           - name: '{HOST.NAME} offline - not seen by local controller'
-            expression: last(/Ubiquiti UniFi USW/unifi.usw.state)<>1
-            recovery_expression: last(/Ubiquiti UniFi USW/unifi.usw.state)=1
+            expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=1
+            recovery_expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=0
           description: Switch port {#PORTID} ({#PORTNAME}) has gone down after previously being up - the connected
             device has lost network connectivity. Check the cable, the NIC on the connected device, and PoE status
             if this is a powered port. Resolves immediately if the port comes back up, or automatically after 24
@@ -7359,8 +7698,8 @@ zabbix_export:
           manual_close: 'YES'
           dependencies:
           - name: '{HOST.NAME} offline - not seen by local controller'
-            expression: last(/Ubiquiti UniFi USW/unifi.usw.state)<>1
-            recovery_expression: last(/Ubiquiti UniFi USW/unifi.usw.state)=1
+            expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=1
+            recovery_expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=0
           description: More than {$UNIFI.PORT.DROPPED.WARN} received packets have been dropped on switch port
             {#PORTID} ({#PORTNAME}) within the last {$UNIFI.PORT.DROPPED.WINDOW}. A low, steady trickle of RX drops
             is normal on a real link (congestion, buffer limits) - this only fires on a genuinely elevated rate, not
@@ -7394,8 +7733,8 @@ zabbix_export:
           manual_close: 'YES'
           dependencies:
           - name: '{HOST.NAME} offline - not seen by local controller'
-            expression: last(/Ubiquiti UniFi USW/unifi.usw.state)<>1
-            recovery_expression: last(/Ubiquiti UniFi USW/unifi.usw.state)=1
+            expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=1
+            recovery_expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=0
           description: More than {$UNIFI.PORT.DROPPED.WARN} transmit packets have been dropped on switch port
             {#PORTID} ({#PORTNAME}) within the last {$UNIFI.PORT.DROPPED.WINDOW}. A low, steady trickle of TX drops
             is normal on a real link (congestion, buffer limits) - this only fires on a genuinely elevated rate, not
@@ -7430,8 +7769,8 @@ zabbix_export:
           manual_close: 'YES'
           dependencies:
           - name: '{HOST.NAME} offline - not seen by local controller'
-            expression: last(/Ubiquiti UniFi USW/unifi.usw.state)<>1
-            recovery_expression: last(/Ubiquiti UniFi USW/unifi.usw.state)=1
+            expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=1
+            recovery_expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=0
           description: Spanning Tree is actively blocking this port to prevent a network loop. If unexpected, check
             for an accidental cable loop or a misconfigured redundant link near this port.
       - uuid: a91b87d7510d4d2fb3f43e611ea186e6
@@ -7573,8 +7912,8 @@ zabbix_export:
           manual_close: 'YES'
           dependencies:
           - name: '{HOST.NAME} offline - not seen by local controller'
-            expression: last(/Ubiquiti UniFi USW/unifi.usw.state)<>1
-            recovery_expression: last(/Ubiquiti UniFi USW/unifi.usw.state)=1
+            expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=1
+            recovery_expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=0
           description: Transmit errors are actively increasing on switch port {#PORTID} ({#PORTNAME}). This typically
             indicates a physical layer issue such as a faulty cable, a duplex mismatch, or a failing NIC on the
             connected device. Replace the cable first as it is the most common cause. Error count resets on device reboot.
@@ -7606,8 +7945,8 @@ zabbix_export:
           manual_close: 'YES'
           dependencies:
           - name: '{HOST.NAME} offline - not seen by local controller'
-            expression: last(/Ubiquiti UniFi USW/unifi.usw.state)<>1
-            recovery_expression: last(/Ubiquiti UniFi USW/unifi.usw.state)=1
+            expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=1
+            recovery_expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=0
           description: Receive errors are actively increasing on switch port {#PORTID} ({#PORTNAME}). Common causes
             include a damaged cable, a failing SFP module, or a faulty NIC on the connected device. Replace the cable
             or SFP first, then investigate the connected device. Error count resets on device reboot.
@@ -7726,8 +8065,8 @@ zabbix_export:
           manual_close: 'YES'
           dependencies:
           - name: '{HOST.NAME} offline - not seen by local controller'
-            expression: last(/Ubiquiti UniFi USW/unifi.usw.state)<>1
-            recovery_expression: last(/Ubiquiti UniFi USW/unifi.usw.state)=1
+            expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=1
+            recovery_expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=0
           description: The SFP module on port {#PORTID} ({#PORTNAME}) is reporting a transmit fault. This typically
             indicates a failed or failing laser, a faulty SFP module, or a broken fibre on the TX strand. The
             link will likely be down. Replace the SFP module and check the fibre patch lead.
@@ -7760,8 +8099,8 @@ zabbix_export:
           manual_close: 'YES'
           dependencies:
           - name: '{HOST.NAME} offline - not seen by local controller'
-            expression: last(/Ubiquiti UniFi USW/unifi.usw.state)<>1
-            recovery_expression: last(/Ubiquiti UniFi USW/unifi.usw.state)=1
+            expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=1
+            recovery_expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=0
           description: The SFP module on port {#PORTID} ({#PORTNAME}) is reporting a receive fault. This typically
             indicates the RX fibre strand is disconnected, dirty, or broken, or the remote TX laser has failed.
             Check the fibre patch lead and clean both connectors.
@@ -7956,8 +8295,8 @@ zabbix_export:
           priority: HIGH
           dependencies:
           - name: '{HOST.NAME} offline - not seen by local controller'
-            expression: last(/Ubiquiti UniFi USW/unifi.usw.state)<>1
-            recovery_expression: last(/Ubiquiti UniFi USW/unifi.usw.state)=1
+            expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=1
+            recovery_expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=0
           description: The SFP module on port {#PORTID} ({#PORTNAME}) has exceeded the critical temperature
             threshold ({$UNIFI.SFP.TEMP.HIGH}°C). At this temperature optical output power degrades and module
             failure is likely. Ensure the switch has adequate airflow and modules are not blocking ventilation.
@@ -7969,8 +8308,8 @@ zabbix_export:
           priority: WARNING
           dependencies:
           - name: '{HOST.NAME} offline - not seen by local controller'
-            expression: last(/Ubiquiti UniFi USW/unifi.usw.state)<>1
-            recovery_expression: last(/Ubiquiti UniFi USW/unifi.usw.state)=1
+            expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=1
+            recovery_expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=0
           description: The SFP module on port {#PORTID} ({#PORTNAME}) is above the warning temperature threshold
             ({$UNIFI.SFP.TEMP.WARN}°C). Commercial-grade SFP+ modules are typically rated to 70°C. Monitor for
             further increases and check for blocked airflow.
@@ -8004,8 +8343,8 @@ zabbix_export:
           manual_close: 'YES'
           dependencies:
           - name: '{HOST.NAME} offline - not seen by local controller'
-            expression: last(/Ubiquiti UniFi USW/unifi.usw.state)<>1
-            recovery_expression: last(/Ubiquiti UniFi USW/unifi.usw.state)=1
+            expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=1
+            recovery_expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=0
           description: Received optical power on port {#PORTID} ({#PORTNAME}) is critically low
             ({$UNIFI.SFP.RXPOWER.LOW.HIGH} dBm threshold). The link is near receiver sensitivity and bit errors
             are likely. Check for a dirty or damaged fibre connector, excessive bend radius, or a failing
@@ -8019,8 +8358,8 @@ zabbix_export:
           manual_close: 'YES'
           dependencies:
           - name: '{HOST.NAME} offline - not seen by local controller'
-            expression: last(/Ubiquiti UniFi USW/unifi.usw.state)<>1
-            recovery_expression: last(/Ubiquiti UniFi USW/unifi.usw.state)=1
+            expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=1
+            recovery_expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=0
           description: Received optical power on port {#PORTID} ({#PORTNAME}) is below the warning threshold
             ({$UNIFI.SFP.RXPOWER.LOW.WARN} dBm). Signal degradation may cause intermittent errors under load.
             Clean both fibre connectors and check for excessive bend radius or damaged patch leads.
@@ -8054,8 +8393,8 @@ zabbix_export:
           manual_close: 'YES'
           dependencies:
           - name: '{HOST.NAME} offline - not seen by local controller'
-            expression: last(/Ubiquiti UniFi USW/unifi.usw.state)<>1
-            recovery_expression: last(/Ubiquiti UniFi USW/unifi.usw.state)=1
+            expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=1
+            recovery_expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=0
           description: Transmit laser power on port {#PORTID} ({#PORTNAME}) is critically low
             ({$UNIFI.SFP.TXPOWER.LOW.HIGH} dBm threshold). The module laser is likely failing. Plan a
             replacement - a module at this level may be causing signal loss at the far end even if no RX
@@ -8069,8 +8408,8 @@ zabbix_export:
           manual_close: 'YES'
           dependencies:
           - name: '{HOST.NAME} offline - not seen by local controller'
-            expression: last(/Ubiquiti UniFi USW/unifi.usw.state)<>1
-            recovery_expression: last(/Ubiquiti UniFi USW/unifi.usw.state)=1
+            expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=1
+            recovery_expression: last(/Ubiquiti UniFi USW/unifi.local.offlineState)=0
           description: Transmit laser output on port {#PORTID} ({#PORTNAME}) is below the warning threshold
             ({$UNIFI.SFP.TXPOWER.LOW.WARN} dBm). This may indicate a degrading laser. A continuing drop will
             eventually cause link errors at the far end.
@@ -8221,6 +8560,22 @@ zabbix_export:
       description: RX/TX dropped-packet count threshold within {$UNIFI.PORT.DROPPED.WINDOW}. Starting default, not
         derived from a large sample of real links - tune per-host after observing your own normal baseline rate
         (Latest data > this port's RX/TX Dropped item) if this fires too often or not sensitively enough.
+    - macro: '{$UNIFI.CONTROLLER.WARMUP}'
+      value: 10m
+      description: 'How long after the local Network application starts before a device it has not yet heard from
+        counts as offline. On startup the application marks every device disconnected until each one checks back
+        in, which can take a few minutes; a device that is genuinely down when the application starts alerts once
+        this has elapsed. Seconds, or a value with an s, m or h suffix.'
+    valuemaps:
+    - uuid: 842f8a445af64ec19138b428a4ac5d11
+      name: Local offline state
+      mappings:
+      - value: '0'
+        newvalue: Seen
+      - value: '1'
+        newvalue: Not seen
+      - value: '2'
+        newvalue: 'Not seen - controller starting up'
   - uuid: ed8f0edb07ac4bdcbd4a698d2df76649
     template: Ubiquiti UniFi UPS
     name: Ubiquiti UniFi UPS
@@ -8228,7 +8583,7 @@ zabbix_export:
       Local controller polling for USW-Deployed-24 (USWDA) with battery backup. Applied alongside Ubiquiti
       UniFi Device by host prototype discovery.
 
-      Version: 1.7.0
+      Version: 1.8.0
     groups:
     - name: Templates
     items:
@@ -8240,7 +8595,7 @@ zabbix_export:
       history: 1h
       value_type: TEXT
       trends: '0'
-      url: https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/{$UNIFI.API.SITE}/stat/device
+      url: https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/{$UNIFI.API.SITE}/stat/device/{$DEVICEMAC}
       timeout: 10s
       headers:
       - name: Cookie
@@ -8254,6 +8609,8 @@ zabbix_export:
           try {
               var mac = '{$DEVICEMAC}';
               var macNorm = mac.replace(/:/g,'').toLowerCase();
+              var base = 'https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/{$UNIFI.API.SITE}';
+              var token = '{$UNIFI.SESSION.TOKEN}';
               var d;
 
               try {
@@ -8273,17 +8630,45 @@ zabbix_export:
                   for (var h in headers) { if (h.toLowerCase() === 'set-cookie') { setCookie = headers[h]; break; } }
                   var m = setCookie && setCookie.match(/{$UNIFI.API.AUTH.TOKEN}=([^;]+);/);
                   if (!m) throw 'fresh login: no token in response headers';
+                  token = m[1];
 
                   var dataReq = new HttpRequest();
-                  dataReq.addHeader('Cookie: {$UNIFI.API.AUTH.TOKEN}=' + m[1]);
-                  var dataResp = dataReq.get('https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/{$UNIFI.API.SITE}/stat/device');
+                  dataReq.addHeader('Cookie: {$UNIFI.API.AUTH.TOKEN}=' + token);
+                  var dataResp = dataReq.get(base + '/stat/device/' + mac);
                   if (dataReq.getStatus() !== 200) throw 'fresh GET HTTP ' + dataReq.getStatus();
                   d = JSON.parse(dataResp);
                   if (!d || !Array.isArray(d.data)) throw 'fresh GET: unexpected response shape';
               }
 
-              var dev = d.data.filter(function(x) { return x.mac && x.mac.replace(/:/g,'').toLowerCase() === macNorm; });
-              return JSON.stringify({data: dev});
+              function mine(list) {
+                  return list.filter(function(x) { return x.mac && x.mac.replace(/:/g,'').toLowerCase() === macNorm; });
+              }
+              var dev = mine(d.data);
+              var state = dev.length ? dev[0].state : 0;
+              var since = null;
+              // The poll asks for this device alone. The full device table is fetched only when the device is not in
+              // contact (connected, upgrading or provisioning) or was not returned at all, because Local Offline State
+              // then needs it to tell a restart of the Network application apart from a fault on this device.
+              if (state !== 1 && state !== 4 && state !== 5) {
+                  try {
+                      var allReq = new HttpRequest();
+                      allReq.addHeader('Cookie: {$UNIFI.API.AUTH.TOKEN}=' + token);
+                      var allResp = allReq.get(base + '/stat/device');
+                      if (allReq.getStatus() !== 200) throw 'HTTP ' + allReq.getStatus();
+                      var all = JSON.parse(allResp).data;
+                      if (!dev.length) dev = mine(all);
+                      // On startup the Network application resets every device's connection state at the same moment,
+                      // so the oldest current connection state across all devices tells how long it has been running.
+                      for (var i = 0; i < all.length; i++) {
+                          if (all[i].adopted === false) continue;
+                          var t = Math.max(all[i].start_connected_millis || 0, all[i].start_disconnected_millis || 0);
+                          if (t > 0 && (since === null || t < since)) since = t;
+                      }
+                  } catch (e) {
+                      Zabbix.log(4, '[UniFi UPS] full device table unavailable (' + e + ')');
+                  }
+              }
+              return JSON.stringify({data: dev, controllerSince: since});
           } catch(e) {
               Zabbix.log(4, '[UniFi UPS] ' + e);
               throw e;
@@ -8311,20 +8696,64 @@ zabbix_export:
       tags:
       - tag: component
         value: ups
+    - uuid: 070939bb52a84149887db354995eadc9
+      name: Local Offline State
+      type: DEPENDENT
+      key: unifi.local.offlineState
+      delay: '0'
+      history: 90d
+      trends: '0'
+      description: 'Alert-ready offline state computed from the local controller''s device table. 0 = seen (state 1
+        connected, 4 upgrading or 5 provisioning - the controller is in contact with the device). 1 = not seen, and
+        the Network application has been running for longer than {$UNIFI.CONTROLLER.WARMUP}. 2 = not seen, but the
+        Network application started less than {$UNIFI.CONTROLLER.WARMUP} ago. On startup the application marks every
+        device disconnected until each one checks back in, which can take a few minutes per device, so a device it
+        has not heard from yet is not evidence of a fault. The start time comes from the same poll: the application
+        resets every device''s connection state at the same moment, so if even the longest-standing connection state
+        across all devices is recent, the application has only just come up.'
+      preprocessing:
+      - type: JAVASCRIPT
+        parameters:
+        - |
+          var d = JSON.parse(value);
+          var dev = (d.data || [])[0];
+          var state = dev ? dev.state : 0;
+          // 1 connected, 4 upgrading, 5 provisioning: the controller is in contact with the device
+          if (state === 1 || state === 4 || state === 5) return 0;
+          var w = String('{$UNIFI.CONTROLLER.WARMUP}').match(/^(\d+)([smh]?)$/);
+          var unit = {s: 1, m: 60, h: 3600};
+          var warmupMs = w ? w[1] * unit[w[2] || 's'] * 1000 : 600000;
+          if (d.controllerSince && Date.now() - d.controllerSince < warmupMs) return 2;
+          return 1;
+      - type: DISCARD_UNCHANGED_HEARTBEAT
+        parameters:
+        - 1m
+      master_item:
+        key: unifi.ups.device
+      valuemap:
+        name: Local offline state
+      tags:
+      - tag: component
+        value: ups
       triggers:
       - uuid: af4f82d3a48c4a42b0d2546947357f13
-        expression: last(/Ubiquiti UniFi UPS/unifi.ups.state)<>1
+        expression: last(/Ubiquiti UniFi UPS/unifi.local.offlineState)=1
         recovery_mode: RECOVERY_EXPRESSION
-        recovery_expression: last(/Ubiquiti UniFi UPS/unifi.ups.state)=1
+        recovery_expression: last(/Ubiquiti UniFi UPS/unifi.local.offlineState)=0
         name: '{HOST.NAME} offline - not seen by local controller'
         priority: HIGH
+        description: The local UniFi controller is not in contact with this device (it is not connected, provisioning
+          or upgrading) and its Network application has been running for longer than {$UNIFI.CONTROLLER.WARMUP}. The
+          device may have lost power or its uplink, or the controller has lost management reachability. Not raised
+          while the application is starting up, when it reports every device disconnected until each checks back in.
+          An already-open problem is held open through a controller restart. Suppressed if the cloud API is already
+          reporting the device offline, to prevent duplicate alerts.
         dependencies:
         - name: '{HOST.NAME} is offline'
-          expression: last(/Ubiquiti UniFi Device/unifi.api.device.offlineState)=1
+          expression: last(/Ubiquiti UniFi Device/unifi.api.device.offlineState)=1 and
+            (last(/Ubiquiti UniFi Device/unifi.device.localVeto)=0 or
+            nodata(/Ubiquiti UniFi Device/unifi.device.localVeto,3m)=1)
           recovery_expression: last(/Ubiquiti UniFi Device/unifi.api.device.offlineState)=0
-        description: The local UniFi controller is reporting this device as offline (state ≠ 1). The device may have 
-          lost power, its uplink connection, or the controller has lost management reachability. This trigger is 
-          suppressed if the cloud API is also reporting the device offline, to prevent duplicate alerts.
     - uuid: 8cfbbbe2975b4d93b6b4df76cb4e044b
       name: CPU Usage
       type: DEPENDENT
@@ -8548,8 +8977,8 @@ zabbix_export:
           priority: WARNING
           dependencies:
           - name: '{HOST.NAME} offline - not seen by local controller'
-            expression: last(/Ubiquiti UniFi UPS/unifi.ups.state)<>1
-            recovery_expression: last(/Ubiquiti UniFi UPS/unifi.ups.state)=1
+            expression: last(/Ubiquiti UniFi UPS/unifi.local.offlineState)=1
+            recovery_expression: last(/Ubiquiti UniFi UPS/unifi.local.offlineState)=0
           description: Outlet {#OUTLETID} ({#OUTLETNAME}) on this UPS is no longer energised. The device connected to 
             this outlet has lost power. Possible causes include an overload trip, a manual disable via the UniFi 
             interface, or a firmware fault. Check the outlet state in UniFi and the load on this outlet.
@@ -8635,6 +9064,22 @@ zabbix_export:
     - macro: '{$UNIFI.UPS.RUNTIME.HIGH}'
       value: '300'
       description: UPS battery runtime critical threshold (s). 300s = 5 minutes.
+    - macro: '{$UNIFI.CONTROLLER.WARMUP}'
+      value: 10m
+      description: 'How long after the local Network application starts before a device it has not yet heard from
+        counts as offline. On startup the application marks every device disconnected until each one checks back
+        in, which can take a few minutes; a device that is genuinely down when the application starts alerts once
+        this has elapsed. Seconds, or a value with an s, m or h suffix.'
+    valuemaps:
+    - uuid: ab58d335d5254d8ca55197b57134afad
+      name: Local offline state
+      mappings:
+      - value: '0'
+        newvalue: Seen
+      - value: '1'
+        newvalue: Not seen
+      - value: '2'
+        newvalue: 'Not seen - controller starting up'
   - uuid: e1400fdb307647e1ad77662c37800555
     template: Ubiquiti UniFi RPS
     name: Ubiquiti UniFi RPS
@@ -8642,7 +9087,7 @@ zabbix_export:
       Local controller polling for USP-RPS (Redundant Power Supply). Monitors PSU failover state - DISASTER
       fires when a connected device loses its primary PSU and the RPS takes over.
 
-      Version: 1.7.0
+      Version: 1.8.0
     groups:
     - name: Templates
     items:
@@ -8654,7 +9099,7 @@ zabbix_export:
       history: 1h
       value_type: TEXT
       trends: '0'
-      url: https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/{$UNIFI.API.SITE}/stat/device
+      url: https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/{$UNIFI.API.SITE}/stat/device/{$DEVICEMAC}
       timeout: 10s
       headers:
       - name: Cookie
@@ -8668,6 +9113,8 @@ zabbix_export:
           try {
               var mac = '{$DEVICEMAC}';
               var macNorm = mac.replace(/:/g,'').toLowerCase();
+              var base = 'https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/{$UNIFI.API.SITE}';
+              var token = '{$UNIFI.SESSION.TOKEN}';
               var d;
 
               try {
@@ -8687,17 +9134,45 @@ zabbix_export:
                   for (var h in headers) { if (h.toLowerCase() === 'set-cookie') { setCookie = headers[h]; break; } }
                   var m = setCookie && setCookie.match(/{$UNIFI.API.AUTH.TOKEN}=([^;]+);/);
                   if (!m) throw 'fresh login: no token in response headers';
+                  token = m[1];
 
                   var dataReq = new HttpRequest();
-                  dataReq.addHeader('Cookie: {$UNIFI.API.AUTH.TOKEN}=' + m[1]);
-                  var dataResp = dataReq.get('https://{$UNIFI.LOCAL.IP}:{$UNIFI.LOCAL.PORT}/{$UNIFI.API.URI}/{$UNIFI.API.SITE}/stat/device');
+                  dataReq.addHeader('Cookie: {$UNIFI.API.AUTH.TOKEN}=' + token);
+                  var dataResp = dataReq.get(base + '/stat/device/' + mac);
                   if (dataReq.getStatus() !== 200) throw 'fresh GET HTTP ' + dataReq.getStatus();
                   d = JSON.parse(dataResp);
                   if (!d || !Array.isArray(d.data)) throw 'fresh GET: unexpected response shape';
               }
 
-              var dev = d.data.filter(function(x) { return x.mac && x.mac.replace(/:/g,'').toLowerCase() === macNorm; });
-              return JSON.stringify({data: dev});
+              function mine(list) {
+                  return list.filter(function(x) { return x.mac && x.mac.replace(/:/g,'').toLowerCase() === macNorm; });
+              }
+              var dev = mine(d.data);
+              var state = dev.length ? dev[0].state : 0;
+              var since = null;
+              // The poll asks for this device alone. The full device table is fetched only when the device is not in
+              // contact (connected, upgrading or provisioning) or was not returned at all, because Local Offline State
+              // then needs it to tell a restart of the Network application apart from a fault on this device.
+              if (state !== 1 && state !== 4 && state !== 5) {
+                  try {
+                      var allReq = new HttpRequest();
+                      allReq.addHeader('Cookie: {$UNIFI.API.AUTH.TOKEN}=' + token);
+                      var allResp = allReq.get(base + '/stat/device');
+                      if (allReq.getStatus() !== 200) throw 'HTTP ' + allReq.getStatus();
+                      var all = JSON.parse(allResp).data;
+                      if (!dev.length) dev = mine(all);
+                      // On startup the Network application resets every device's connection state at the same moment,
+                      // so the oldest current connection state across all devices tells how long it has been running.
+                      for (var i = 0; i < all.length; i++) {
+                          if (all[i].adopted === false) continue;
+                          var t = Math.max(all[i].start_connected_millis || 0, all[i].start_disconnected_millis || 0);
+                          if (t > 0 && (since === null || t < since)) since = t;
+                      }
+                  } catch (e) {
+                      Zabbix.log(4, '[UniFi RPS] full device table unavailable (' + e + ')');
+                  }
+              }
+              return JSON.stringify({data: dev, controllerSince: since});
           } catch(e) {
               Zabbix.log(4, '[UniFi RPS] ' + e);
               throw e;
@@ -8725,20 +9200,64 @@ zabbix_export:
       tags:
       - tag: component
         value: rps
+    - uuid: dc3c5ed3c5ad4413a1f94b66dc9ea5df
+      name: Local Offline State
+      type: DEPENDENT
+      key: unifi.local.offlineState
+      delay: '0'
+      history: 90d
+      trends: '0'
+      description: 'Alert-ready offline state computed from the local controller''s device table. 0 = seen (state 1
+        connected, 4 upgrading or 5 provisioning - the controller is in contact with the device). 1 = not seen, and
+        the Network application has been running for longer than {$UNIFI.CONTROLLER.WARMUP}. 2 = not seen, but the
+        Network application started less than {$UNIFI.CONTROLLER.WARMUP} ago. On startup the application marks every
+        device disconnected until each one checks back in, which can take a few minutes per device, so a device it
+        has not heard from yet is not evidence of a fault. The start time comes from the same poll: the application
+        resets every device''s connection state at the same moment, so if even the longest-standing connection state
+        across all devices is recent, the application has only just come up.'
+      preprocessing:
+      - type: JAVASCRIPT
+        parameters:
+        - |
+          var d = JSON.parse(value);
+          var dev = (d.data || [])[0];
+          var state = dev ? dev.state : 0;
+          // 1 connected, 4 upgrading, 5 provisioning: the controller is in contact with the device
+          if (state === 1 || state === 4 || state === 5) return 0;
+          var w = String('{$UNIFI.CONTROLLER.WARMUP}').match(/^(\d+)([smh]?)$/);
+          var unit = {s: 1, m: 60, h: 3600};
+          var warmupMs = w ? w[1] * unit[w[2] || 's'] * 1000 : 600000;
+          if (d.controllerSince && Date.now() - d.controllerSince < warmupMs) return 2;
+          return 1;
+      - type: DISCARD_UNCHANGED_HEARTBEAT
+        parameters:
+        - 1m
+      master_item:
+        key: unifi.rps.device
+      valuemap:
+        name: Local offline state
+      tags:
+      - tag: component
+        value: rps
       triggers:
       - uuid: 6a492342ccee4822b11dbfbe9a8a00a8
-        expression: last(/Ubiquiti UniFi RPS/unifi.rps.state)<>1
+        expression: last(/Ubiquiti UniFi RPS/unifi.local.offlineState)=1
         recovery_mode: RECOVERY_EXPRESSION
-        recovery_expression: last(/Ubiquiti UniFi RPS/unifi.rps.state)=1
+        recovery_expression: last(/Ubiquiti UniFi RPS/unifi.local.offlineState)=0
         name: '{HOST.NAME} offline - not seen by local controller'
         priority: HIGH
+        description: The local UniFi controller is not in contact with this device (it is not connected, provisioning
+          or upgrading) and its Network application has been running for longer than {$UNIFI.CONTROLLER.WARMUP}. The
+          device may have lost power or its uplink, or the controller has lost management reachability. Not raised
+          while the application is starting up, when it reports every device disconnected until each checks back in.
+          An already-open problem is held open through a controller restart. Suppressed if the cloud API is already
+          reporting the device offline, to prevent duplicate alerts.
         dependencies:
         - name: '{HOST.NAME} is offline'
-          expression: last(/Ubiquiti UniFi Device/unifi.api.device.offlineState)=1
+          expression: last(/Ubiquiti UniFi Device/unifi.api.device.offlineState)=1 and
+            (last(/Ubiquiti UniFi Device/unifi.device.localVeto)=0 or
+            nodata(/Ubiquiti UniFi Device/unifi.device.localVeto,3m)=1)
           recovery_expression: last(/Ubiquiti UniFi Device/unifi.api.device.offlineState)=0
-        description: The local UniFi controller is reporting this device as offline (state ≠ 1). The device may have 
-          lost power, its uplink connection, or the controller has lost management reachability. This trigger is 
-          suppressed if the cloud API is also reporting the device offline, to prevent duplicate alerts.
     - uuid: 1e5aecc76ea34f67880d40cd40bcac42
       name: CPU Usage
       type: DEPENDENT
@@ -9022,8 +9541,8 @@ zabbix_export:
             PSU.
           dependencies:
           - name: '{HOST.NAME} offline - not seen by local controller'
-            expression: last(/Ubiquiti UniFi RPS/unifi.rps.state)<>1
-            recovery_expression: last(/Ubiquiti UniFi RPS/unifi.rps.state)=1
+            expression: last(/Ubiquiti UniFi RPS/unifi.local.offlineState)=1
+            recovery_expression: last(/Ubiquiti UniFi RPS/unifi.local.offlineState)=0
       - uuid: 8bc2cde8e674465aa2040d1404fa90e2
         name: RPS Port {#RPSPORTID} ({#RPSPORTNAME}) Delivering
         type: DEPENDENT
@@ -9074,8 +9593,8 @@ zabbix_export:
           priority: WARNING
           dependencies:
           - name: '{HOST.NAME} offline - not seen by local controller'
-            expression: last(/Ubiquiti UniFi RPS/unifi.rps.state)<>1
-            recovery_expression: last(/Ubiquiti UniFi RPS/unifi.rps.state)=1
+            expression: last(/Ubiquiti UniFi RPS/unifi.local.offlineState)=1
+            recovery_expression: last(/Ubiquiti UniFi RPS/unifi.local.offlineState)=0
           description: RPS port {#RPSPORTID} ({#RPSPORTNAME}) is no longer connected. The device on this port has no 
             redundant power supply protection - if its primary PSU now fails, it will lose power with no failover. Check
             the RPS cable connection from the RPS unit to the device.
@@ -9205,7 +9724,22 @@ zabbix_export:
     - macro: '{$UNIFI.UPS.RUNTIME.HIGH}'
       value: '300'
       description: UPS battery runtime critical threshold (s). 300s = 5 minutes.
-
+    - macro: '{$UNIFI.CONTROLLER.WARMUP}'
+      value: 10m
+      description: 'How long after the local Network application starts before a device it has not yet heard from
+        counts as offline. On startup the application marks every device disconnected until each one checks back
+        in, which can take a few minutes; a device that is genuinely down when the application starts alerts once
+        this has elapsed. Seconds, or a value with an s, m or h suffix.'
+    valuemaps:
+    - uuid: 35a9af340e4e4555b1221da42e8e3a2e
+      name: Local offline state
+      mappings:
+      - value: '0'
+        newvalue: Seen
+      - value: '1'
+        newvalue: Not seen
+      - value: '2'
+        newvalue: 'Not seen - controller starting up'
   - uuid: db85d205886840f6a14f1aa06ffeb682
     template: Ubiquiti UniFi Protect Camera
     name: Ubiquiti UniFi Protect Camera
@@ -9214,7 +9748,7 @@ zabbix_export:
       Protect Cameras" on Ubiquiti UniFi API Host. Reuses the same session token already cached by that console's
       unifi.host.session item - no separate login or credentials of its own.
 
-      Version: 1.7.0
+      Version: 1.8.0
     groups:
     - name: Templates
     items:
@@ -9677,7 +10211,7 @@ zabbix_export:
       types have no recording concept. Reuses the same session token already cached by that console's
       unifi.host.session item - no separate login or credentials of its own.
 
-      Version: 1.7.0
+      Version: 1.8.0
     groups:
     - name: Templates
     items:
