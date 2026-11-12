@@ -335,6 +335,7 @@ Common optional overrides:
 | `{$UNIFI.WAN.LATENCY.WARN}` | `100` (ms) | Raise to 200+ for high-latency links (e.g. Central America sites with 60-80ms base RTT to UK) |
 | `{$UNIFI.WAN.ENABLED:WAN2}` | `1` | Set to `0` if WAN2 is not physically connected on this gateway |
 | `{$UNIFI.CPU.USAGE.WARN}` | `80` | Adjust per device capability |
+| `{$UNIFI.CPU.USAGE.WINDOW}` | `5m` | Raise if a busy gateway still alarms on short CPU bursts; lower for faster alerting |
 | `{$UNIFI.TEMP.WARN}` | `70` | Adjust for deployment environment |
 | `{$BACKUP_INTERVAL}` | `8d` | Match your configured UniFi backup schedule |
 
@@ -387,8 +388,10 @@ Common optional overrides:
 | `{$UNIFI.WAN.ENABLED:WAN2}` | `1` | WAN2-specific alarm switch, set to 0 to suppress all WAN2 alarms |
 | `{$UNIFI.CPU.USAGE.WARN}` | `80` | CPU usage warning threshold (%) |
 | `{$UNIFI.CPU.USAGE.HIGH}` | `90` | CPU usage critical threshold (%) |
+| `{$UNIFI.CPU.USAGE.WINDOW}` | `5m` | How long CPU must stay above a threshold before the CPU alarms fire. Every sample in the window must be over the threshold, so routine spikes of a few seconds are ignored. Keep it longer than `{$UNIFI.CONSOLE.POLL.INTERVAL}` (default `3m`) so it always spans more than one sample |
 | `{$UNIFI.MEM.USAGE.WARN}` | `80` | Memory usage warning threshold (%) |
 | `{$UNIFI.MEM.USAGE.HIGH}` | `90` | Memory usage critical threshold (%) |
+| `{$UNIFI.MEM.USAGE.WINDOW}` | `5m` | How long memory must stay above a threshold before the memory alarms fire, on the same terms as `{$UNIFI.CPU.USAGE.WINDOW}` |
 | `{$UNIFI.TEMP.WARN}` | `70` | Temperature warning threshold (°C) |
 | `{$UNIFI.TEMP.HIGH}` | `80` | Temperature critical threshold (°C) |
 | `{$UNIFI.PROTECT.API.URI}` | `proxy/protect/api` | Local Protect controller API base path |
@@ -408,8 +411,10 @@ Common optional overrides:
 | `{$UNIFI.PORT.DROPPED.WARN}` | `1000` | Switch RX/TX dropped-packet count threshold within `{$UNIFI.PORT.DROPPED.WINDOW}` - starting default, tune to your own link's normal baseline (USW only) |
 | `{$UNIFI.CPU.USAGE.WARN}` | `80` | CPU warning (%) |
 | `{$UNIFI.CPU.USAGE.HIGH}` | `90` | CPU critical (%), UAP/USW only |
+| `{$UNIFI.CPU.USAGE.WINDOW}` | `5m` | How long CPU must stay above a threshold before alarming |
 | `{$UNIFI.MEM.USAGE.WARN}` | `80` | Memory warning (%) |
 | `{$UNIFI.MEM.USAGE.HIGH}` | `90` | Memory critical (%), UAP/USW only |
+| `{$UNIFI.MEM.USAGE.WINDOW}` | `5m` | How long memory must stay above a threshold before alarming |
 | `{$UNIFI.TEMP.WARN}` | `55` | Temperature warning (°C), RPS only |
 | `{$UNIFI.TEMP.HIGH}` | `65` | Temperature critical (°C), RPS only |
 | `{$UNIFI.UPS.BATTERY.WARN}` | `20` | UPS battery warning threshold (%) |
@@ -465,14 +470,14 @@ Severities follow standard Zabbix conventions: INFO < WARNING < AVERAGE < HIGH <
 | HA failover: gateway is now STANDBY | DISASTER | Primary failed; this unit is now serving traffic |
 | WAN status is not OK | HIGH | Local WAN health reports a non-ok state |
 | Shadow Mode link (eth6) disconnected | HIGH | HA interconnect cable is unplugged |
-| Gateway CPU usage critical | HIGH | CPU > `{$UNIFI.CPU.USAGE.HIGH}`% |
+| Gateway CPU usage critical | HIGH | CPU > `{$UNIFI.CPU.USAGE.HIGH}`% for `{$UNIFI.CPU.USAGE.WINDOW}` |
 | Gateway CPU temperature critical | HIGH | CPU temp > `{$UNIFI.TEMP.HIGH}`°C |
 | Gateway board temperature critical | HIGH | Board temp > `{$UNIFI.TEMP.HIGH}`°C |
-| Gateway memory usage critical | HIGH | Memory > `{$UNIFI.MEM.USAGE.HIGH}`% |
-| Gateway CPU usage high | WARNING | CPU > `{$UNIFI.CPU.USAGE.WARN}`% |
+| Gateway memory usage critical | HIGH | Memory > `{$UNIFI.MEM.USAGE.HIGH}`% for `{$UNIFI.MEM.USAGE.WINDOW}` |
+| Gateway CPU usage high | WARNING | CPU > `{$UNIFI.CPU.USAGE.WARN}`% for `{$UNIFI.CPU.USAGE.WINDOW}` |
 | Gateway CPU temperature high | WARNING | CPU temp > `{$UNIFI.TEMP.WARN}`°C |
 | Gateway board temperature high | WARNING | Board temp > `{$UNIFI.TEMP.WARN}`°C |
-| Gateway memory usage high | WARNING | Memory > `{$UNIFI.MEM.USAGE.WARN}`% |
+| Gateway memory usage high | WARNING | Memory > `{$UNIFI.MEM.USAGE.WARN}`% for `{$UNIFI.MEM.USAGE.WINDOW}` |
 | WAN IP changed | WARNING | Local WAN IP changed from one value to another |
 | ISP name changed | INFO | ISP name reported by the local controller changed |
 | Shadow Mode peer IP changed | INFO | HA peer management IP changed |
@@ -580,11 +585,11 @@ The following alarms come from the **Ubiquiti UniFi UAP** template (local contro
 |-------|----------|-----------|
 | Offline - not seen by local controller | HIGH | The local controller is not in contact with the device (state is not connected, provisioning or upgrading), and its Network application has been running longer than `{$UNIFI.CONTROLLER.WARMUP}` (default 10m). Alarms on a single poll, no persistence window (see [Network Application Restarts](#network-application-restarts)) |
 | Device offline (cloud) | HIGH | Cloud API reports the device offline while its console still reads online in the same payload - a real single-device failure, not a site-wide outage. Fires on the first offline sample, ~1 minute. Held back while the local controller, where reachable, still sees the device or is starting up (see [Site Outage Alarm Suppression](#site-outage-alarm-suppression)) |
-| CPU usage critical | HIGH | CPU > `{$UNIFI.CPU.USAGE.HIGH}`% |
-| Memory usage critical | HIGH | Memory > `{$UNIFI.MEM.USAGE.HIGH}`% |
+| CPU usage critical | HIGH | CPU > `{$UNIFI.CPU.USAGE.HIGH}`% for `{$UNIFI.CPU.USAGE.WINDOW}` |
+| Memory usage critical | HIGH | Memory > `{$UNIFI.MEM.USAGE.HIGH}`% for `{$UNIFI.MEM.USAGE.WINDOW}` |
 | Radio not running | HIGH | Radio state is not RUN |
-| CPU usage high | WARNING | CPU > `{$UNIFI.CPU.USAGE.WARN}`% |
-| Memory usage high | WARNING | Memory > `{$UNIFI.MEM.USAGE.WARN}`% |
+| CPU usage high | WARNING | CPU > `{$UNIFI.CPU.USAGE.WARN}`% for `{$UNIFI.CPU.USAGE.WINDOW}` |
+| Memory usage high | WARNING | Memory > `{$UNIFI.MEM.USAGE.WARN}`% for `{$UNIFI.MEM.USAGE.WINDOW}` |
 | Firmware upgrade available | WARNING | Local controller reports an upgrade is available |
 | Uptime less than {$UNIFI.UPTIME.WARN}h | WARNING | Device uptime below threshold, indicating a recent reboot |
 | Device no longer managed | AVERAGE | Device has been removed from management |
@@ -600,15 +605,15 @@ The following alarms come from the **Ubiquiti UniFi USW** template (local contro
 |-------|----------|-----------|
 | Offline - not seen by local controller | HIGH | The local controller is not in contact with the device (state is not connected, provisioning or upgrading), and its Network application has been running longer than `{$UNIFI.CONTROLLER.WARMUP}` (default 10m). Alarms on a single poll, no persistence window (see [Network Application Restarts](#network-application-restarts)) |
 | Device offline (cloud) | HIGH | Cloud API reports the device offline while its console still reads online in the same payload - a real single-device failure, not a site-wide outage. Fires on the first offline sample, ~1 minute. Held back while the local controller, where reachable, still sees the device or is starting up (see [Site Outage Alarm Suppression](#site-outage-alarm-suppression)) |
-| CPU usage critical | HIGH | CPU > `{$UNIFI.CPU.USAGE.HIGH}`% |
-| Memory usage critical | HIGH | Memory > `{$UNIFI.MEM.USAGE.HIGH}`% |
+| CPU usage critical | HIGH | CPU > `{$UNIFI.CPU.USAGE.HIGH}`% for `{$UNIFI.CPU.USAGE.WINDOW}` |
+| Memory usage critical | HIGH | Memory > `{$UNIFI.MEM.USAGE.HIGH}`% for `{$UNIFI.MEM.USAGE.WINDOW}` |
 | SFP TX fault active | HIGH | Module reports a transmit laser fault, likely a failed SFP or broken TX fibre |
 | SFP RX fault active | HIGH | Module reports a receive fault, likely a broken RX fibre or failed remote laser |
 | SFP temperature critical | HIGH | SFP module temp > `{$UNIFI.SFP.TEMP.HIGH}`°C |
 | SFP RX power critical low | HIGH | Received optical power < `{$UNIFI.SFP.RXPOWER.LOW.HIGH}` dBm, near receiver limit |
 | SFP TX power critical low | HIGH | Transmit laser output < `{$UNIFI.SFP.TXPOWER.LOW.HIGH}` dBm, laser likely failing |
-| CPU usage high | WARNING | CPU > `{$UNIFI.CPU.USAGE.WARN}`% |
-| Memory usage high | WARNING | Memory > `{$UNIFI.MEM.USAGE.WARN}`% |
+| CPU usage high | WARNING | CPU > `{$UNIFI.CPU.USAGE.WARN}`% for `{$UNIFI.CPU.USAGE.WINDOW}` |
+| Memory usage high | WARNING | Memory > `{$UNIFI.MEM.USAGE.WARN}`% for `{$UNIFI.MEM.USAGE.WINDOW}` |
 | Port down | WARNING | Port transitions from up to down after previously being up |
 | Port TX errors increasing | WARNING | TX error counter is actively incrementing |
 | Port RX errors increasing | WARNING | RX error counter is actively incrementing |
@@ -645,8 +650,8 @@ The following alarms come from the **Ubiquiti UniFi UPS** template (local contro
 | Running on battery, mains power failed | HIGH | UPS is in battery mode |
 | Battery level low | WARNING | Battery < `{$UNIFI.UPS.BATTERY.WARN}`% |
 | Outlet lost power | WARNING | Outlet relay state = off |
-| CPU usage high | WARNING | CPU > `{$UNIFI.CPU.USAGE.WARN}`% |
-| Memory usage high | WARNING | Memory > `{$UNIFI.MEM.USAGE.WARN}`% |
+| CPU usage high | WARNING | CPU > `{$UNIFI.CPU.USAGE.WARN}`% for `{$UNIFI.CPU.USAGE.WINDOW}` |
+| Memory usage high | WARNING | Memory > `{$UNIFI.MEM.USAGE.WARN}`% for `{$UNIFI.MEM.USAGE.WINDOW}` |
 | Uptime less than {$UNIFI.UPTIME.WARN}h | WARNING | Device uptime below threshold, indicating a recent reboot |
 | Device no longer managed | AVERAGE | Device has been removed from management |
 | Firmware update available (cloud) | INFO | Cloud API reports a newer version is available |
@@ -669,8 +674,8 @@ The following alarms come from the **Ubiquiti UniFi RPS** template (local contro
 | RPS port disconnected, redundancy lost | WARNING | Port is not connected; device has no redundant power path |
 
 > **RPS port discovery** only creates items for ports that have a connected device. Ports with a generic name (e.g. `Port 1`, `Port 2`) are filtered out by design, since those ports have nothing plugged in yet. Once a device is connected, the RPS names the port after the device's hostname (e.g. `FRN1CORESW01`), and it's automatically discovered on the next LLD cycle.
-| CPU usage high | WARNING | CPU > `{$UNIFI.CPU.USAGE.WARN}`% |
-| Memory usage high | WARNING | Memory > `{$UNIFI.MEM.USAGE.WARN}`% |
+| CPU usage high | WARNING | CPU > `{$UNIFI.CPU.USAGE.WARN}`% for `{$UNIFI.CPU.USAGE.WINDOW}` |
+| Memory usage high | WARNING | Memory > `{$UNIFI.MEM.USAGE.WARN}`% for `{$UNIFI.MEM.USAGE.WINDOW}` |
 | Uptime less than {$UNIFI.UPTIME.WARN}h | WARNING | Device uptime below threshold, indicating a recent reboot |
 | Device no longer managed | AVERAGE | Device has been removed from management |
 | Firmware update available (cloud) | INFO | Cloud API reports a newer version is available |
