@@ -2,6 +2,21 @@
 
 All notable changes to this template set are documented here. Versioning starts at 1.1.0 (2026-07-08); everything before that was tracked by date only, so those older entries are kept as-is rather than renumbered retroactively.
 
+## [1.8.1] - 2026-11-12
+
+Stops the CPU and memory alarms firing on momentary spikes.
+
+### Fixed
+- **CPU alarms now need CPU to stay high, not one high sample.** Every CPU trigger (`Gateway CPU usage critical` / `high` on `Ubiquiti UniFi API Host`, and `CPU critical` / `high` on `Ubiquiti UniFi UAP`, `USW`, `UPS` and `RPS`) compared `last()` against its threshold, so a single poll that landed on a short burst raised a HIGH alarm. Observed on a UDM Pro: a 30-second spike to 96% raised "Gateway CPU usage critical" and resolved 30 seconds later, against an hour that averaged 40%. The UniFi dashboard's CPU graph, which plots averaged buckets, never showed the spike. The triggers now use `min()` over a new `{$UNIFI.CPU.USAGE.WINDOW}`, so they fire only when every sample in the window is over the threshold. They still recover on the first sample back under the threshold. This matches the approach of Zabbix's own stock OS templates.
+- **Memory alarms get the same treatment, with their own `{$UNIFI.MEM.USAGE.WINDOW}`.** The gateway and per-device memory triggers had the same single-sample `last()` check. The same UDM Pro, which also runs Protect, sits at about 78% memory, just under the 80% warning, and UniFi's own chart showed it peaking at about 82%. A single poll over the line would have raised a warning.
+
+### Added
+- `{$UNIFI.CPU.USAGE.WINDOW}` and `{$UNIFI.MEM.USAGE.WINDOW}` (both default `5m`) on `Ubiquiti UniFi API Host` and on each device-type template, alongside the existing thresholds.
+
+### Considered and not changed
+- **WAN latency.** `latency_average` in `stat/health` is already averaged over 24 hours (`time_period: 86400`), so a short burst cannot move it and a window would add nothing.
+- **Temperatures and SFP optical power.** These change slowly and read steadily, so a single high sample is a genuine reading. If one flaps at its threshold, a lower recovery threshold is the better fix.
+
 ## [1.8.0] - 2026-10-15
 
 > **Note:** a WAN that is down continuously will now raise "sustained downtime", which the old period counting could never do. If an unused WAN port starts alarming after upgrading, set `{$UNIFI.WAN.ENABLED:<WAN>}=0` on that console host - see "WAN Alarm Suppression" in the README. Those alarms now respect that macro.

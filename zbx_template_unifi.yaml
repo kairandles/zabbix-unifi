@@ -29,7 +29,7 @@ zabbix_export:
 
       Template available at https://github.com/kairandles/zabbix-unifi
 
-      Version: 1.8.0
+      Version: 1.8.1
     groups:
     - name: Templates
     items:
@@ -358,7 +358,7 @@ zabbix_export:
 
       Template available at https://github.com/kairandles/zabbix-unifi
 
-      Version: 1.8.0
+      Version: 1.8.1
     groups:
     - name: Templates
     items:
@@ -1042,18 +1042,18 @@ zabbix_export:
         value: Local Gateway
       triggers:
       - uuid: 6eefd2c7fd6f457bbe29c96bfbfdfec7
-        expression: last(/Ubiquiti UniFi API Host/unifi.local.cpu)>{$UNIFI.CPU.USAGE.HIGH}
+        expression: min(/Ubiquiti UniFi API Host/unifi.local.cpu,{$UNIFI.CPU.USAGE.WINDOW})>{$UNIFI.CPU.USAGE.HIGH}
         name: 'Gateway CPU usage critical: {ITEM.LASTVALUE} (threshold: {$UNIFI.CPU.USAGE.HIGH}%)'
         priority: HIGH
-        description: Gateway CPU has exceeded the critical threshold ({$UNIFI.CPU.USAGE.HIGH}%). At sustained high CPU 
+        description: Gateway CPU has stayed above the critical threshold ({$UNIFI.CPU.USAGE.HIGH}%) for at least {$UNIFI.CPU.USAGE.WINDOW}. At sustained high CPU 
           the gateway may drop packets, slow routing, or fail to process IPS/firewall rules correctly. Check for unusual
           traffic bursts, a high IPS signature load, or consider a firmware update.
       - uuid: 705601ee75e24e308c82ea3ae1192588
-        expression: last(/Ubiquiti UniFi API Host/unifi.local.cpu)>{$UNIFI.CPU.USAGE.WARN} and last(/Ubiquiti UniFi API 
-          Host/unifi.local.cpu)<={$UNIFI.CPU.USAGE.HIGH}
+        expression: min(/Ubiquiti UniFi API Host/unifi.local.cpu,{$UNIFI.CPU.USAGE.WINDOW})>{$UNIFI.CPU.USAGE.WARN} and
+          min(/Ubiquiti UniFi API Host/unifi.local.cpu,{$UNIFI.CPU.USAGE.WINDOW})<={$UNIFI.CPU.USAGE.HIGH}
         name: 'Gateway CPU usage high: {ITEM.LASTVALUE} (threshold: {$UNIFI.CPU.USAGE.WARN}%)'
         priority: WARNING
-        description: Gateway CPU is elevated above the warning threshold ({$UNIFI.CPU.USAGE.WARN}%). This is within 
+        description: Gateway CPU has stayed above the warning threshold ({$UNIFI.CPU.USAGE.WARN}%) for at least {$UNIFI.CPU.USAGE.WINDOW}. This is within 
           operational range but should be monitored. Sustained high CPU often indicates heavy IPS/firewall activity or a
           firmware issue.
     - uuid: 2148b85757f5406a9d38bd783ce494b9
@@ -1080,18 +1080,18 @@ zabbix_export:
         value: Local Gateway
       triggers:
       - uuid: 9c965cbb0b0a42e182bb25d36270a05d
-        expression: last(/Ubiquiti UniFi API Host/unifi.local.mem)>{$UNIFI.MEM.USAGE.HIGH}
+        expression: min(/Ubiquiti UniFi API Host/unifi.local.mem,{$UNIFI.MEM.USAGE.WINDOW})>{$UNIFI.MEM.USAGE.HIGH}
         name: 'Gateway memory usage critical: {ITEM.LASTVALUE} (threshold: {$UNIFI.MEM.USAGE.HIGH}%)'
         priority: HIGH
-        description: Gateway memory has exceeded the critical threshold ({$UNIFI.MEM.USAGE.HIGH}%). At this level the 
+        description: Gateway memory has stayed above the critical threshold ({$UNIFI.MEM.USAGE.HIGH}%) for at least {$UNIFI.MEM.USAGE.WINDOW}. At this level the 
           gateway may start dropping new connections or become sluggish. Common causes include a high active-session 
           count, IPS signature loading, or a firmware memory leak.
       - uuid: 958cf363c8954eba8613533dd5023f60
-        expression: last(/Ubiquiti UniFi API Host/unifi.local.mem)>{$UNIFI.MEM.USAGE.WARN} and last(/Ubiquiti UniFi API 
-          Host/unifi.local.mem)<={$UNIFI.MEM.USAGE.HIGH}
+        expression: min(/Ubiquiti UniFi API Host/unifi.local.mem,{$UNIFI.MEM.USAGE.WINDOW})>{$UNIFI.MEM.USAGE.WARN} and
+          min(/Ubiquiti UniFi API Host/unifi.local.mem,{$UNIFI.MEM.USAGE.WINDOW})<={$UNIFI.MEM.USAGE.HIGH}
         name: 'Gateway memory usage high: {ITEM.LASTVALUE} (threshold: {$UNIFI.MEM.USAGE.WARN}%)'
         priority: WARNING
-        description: Gateway memory usage is elevated above the warning threshold ({$UNIFI.MEM.USAGE.WARN}%). Monitor 
+        description: Gateway memory usage has stayed above the warning threshold ({$UNIFI.MEM.USAGE.WARN}%) for at least {$UNIFI.MEM.USAGE.WINDOW}. Monitor 
           for further increases. Common causes include a large number of active connections, IPS being enabled, or a 
           firmware-related memory leak.
     - uuid: 3ffaad81a6a647d487e8f8dee70a3373
@@ -5622,12 +5622,18 @@ zabbix_export:
     - macro: '{$UNIFI.CPU.USAGE.HIGH}'
       value: '90'
       description: CPU usage % HIGH threshold
+    - macro: '{$UNIFI.CPU.USAGE.WINDOW}'
+      value: 5m
+      description: Time window CPU usage must stay above a threshold before the CPU alarms fire - every sample in the window must exceed it. Rides out the short spikes routine background work produces, which the UniFi dashboard's averaged CPU graph never shows.
     - macro: '{$UNIFI.MEM.USAGE.WARN}'
       value: '80'
       description: Memory usage % WARNING threshold
     - macro: '{$UNIFI.MEM.USAGE.HIGH}'
       value: '90'
       description: Memory usage % HIGH threshold
+    - macro: '{$UNIFI.MEM.USAGE.WINDOW}'
+      value: 5m
+      description: Time window memory usage must stay above a threshold before the memory alarms fire - every sample in the window must exceed it. Rides out short bursts, which the UniFi dashboard's averaged memory graph never shows.
     - macro: '{$UNIFI.TEMP.WARN}'
       value: '70'
       description: Temperature °C WARNING threshold
@@ -5698,7 +5704,7 @@ zabbix_export:
       Applied to SD-WAN config hosts discovered by Ubiquiti UniFi API. Monitors tunnel health, configuration
       status, and WAN internet issues for each SD-WAN config via /v1/sd-wan-configs/{id}/status.
 
-      Version: 1.8.0
+      Version: 1.8.1
     groups:
     - name: Templates
     items:
@@ -6008,7 +6014,7 @@ zabbix_export:
       Monitors device status, firmware, version, uptime, and IP via cloud API.
       Macros {$HOSTID} and {$DEVICEID} are set automatically by the discovering gateway's host prototype.
 
-      Version: 1.8.0
+      Version: 1.8.1
 
       Template available at https://github.com/kairandles/zabbix-unifi
     groups:
@@ -6463,7 +6469,7 @@ zabbix_export:
       Local controller polling for UniFi Access Points. Applied alongside Ubiquiti UniFi Device by host
       prototype discovery.
 
-      Version: 1.8.0
+      Version: 1.8.1
     groups:
     - name: Templates
     items:
@@ -6655,17 +6661,17 @@ zabbix_export:
         value: uap
       triggers:
       - uuid: 7491c47520324cc1a9e6a804ea63a0c0
-        expression: last(/Ubiquiti UniFi UAP/unifi.uap.cpu)>{$UNIFI.CPU.USAGE.HIGH}
+        expression: min(/Ubiquiti UniFi UAP/unifi.uap.cpu,{$UNIFI.CPU.USAGE.WINDOW})>{$UNIFI.CPU.USAGE.HIGH}
         name: '{HOST.NAME} CPU critical: {ITEM.LASTVALUE} (threshold: {$UNIFI.CPU.USAGE.HIGH}%)'
         priority: HIGH
-        description: Device CPU has exceeded the critical threshold ({$UNIFI.CPU.USAGE.HIGH}%). At sustained high CPU the device may drop connections, slow 
+        description: Device CPU has stayed above the critical threshold ({$UNIFI.CPU.USAGE.HIGH}%) for at least {$UNIFI.CPU.USAGE.WINDOW}. At sustained high CPU the device may drop connections, slow 
           control-plane processing, or behave erratically. Check for firmware issues or an unusually high load, and 
           consider a reboot if the condition persists.
       - uuid: 027c6f0775414fa5be1ddb3bfd9ef8d6
-        expression: last(/Ubiquiti UniFi UAP/unifi.uap.cpu)>{$UNIFI.CPU.USAGE.WARN} and last(/Ubiquiti UniFi UAP/unifi.uap.cpu)<={$UNIFI.CPU.USAGE.HIGH}
+        expression: min(/Ubiquiti UniFi UAP/unifi.uap.cpu,{$UNIFI.CPU.USAGE.WINDOW})>{$UNIFI.CPU.USAGE.WARN} and min(/Ubiquiti UniFi UAP/unifi.uap.cpu,{$UNIFI.CPU.USAGE.WINDOW})<={$UNIFI.CPU.USAGE.HIGH}
         name: '{HOST.NAME} CPU high: {ITEM.LASTVALUE} (threshold: {$UNIFI.CPU.USAGE.WARN}%)'
         priority: WARNING
-        description: Device CPU usage is elevated above the warning threshold ({$UNIFI.CPU.USAGE.WARN}%). This is within operational tolerance but should be 
+        description: Device CPU usage has stayed above the warning threshold ({$UNIFI.CPU.USAGE.WARN}%) for at least {$UNIFI.CPU.USAGE.WINDOW}. This is within operational tolerance but should be 
           monitored. Sustained high CPU can indicate heavy traffic, an active RF scan (on APs), or a firmware issue.
     - uuid: 3a39cd37d4154735b809388f34d8e38c
       name: Memory Usage
@@ -6688,16 +6694,16 @@ zabbix_export:
         value: uap
       triggers:
       - uuid: 495b4c85758843698be7adda6e296109
-        expression: last(/Ubiquiti UniFi UAP/unifi.uap.mem)>{$UNIFI.MEM.USAGE.HIGH}
+        expression: min(/Ubiquiti UniFi UAP/unifi.uap.mem,{$UNIFI.MEM.USAGE.WINDOW})>{$UNIFI.MEM.USAGE.HIGH}
         name: '{HOST.NAME} memory critical: {ITEM.LASTVALUE} (threshold: {$UNIFI.MEM.USAGE.HIGH}%)'
         priority: HIGH
-        description: Device memory has exceeded the critical threshold ({$UNIFI.MEM.USAGE.HIGH}%). The device may begin dropping new associations or behave 
+        description: Device memory has stayed above the critical threshold ({$UNIFI.MEM.USAGE.HIGH}%) for at least {$UNIFI.MEM.USAGE.WINDOW}. The device may begin dropping new associations or behave 
           erratically. A reboot will typically recover memory; if the issue recurs, check for a firmware memory leak.
       - uuid: 36eb0f68d4524b998e791fce69e5c35d
-        expression: last(/Ubiquiti UniFi UAP/unifi.uap.mem)>{$UNIFI.MEM.USAGE.WARN} and last(/Ubiquiti UniFi UAP/unifi.uap.mem)<={$UNIFI.MEM.USAGE.HIGH}
+        expression: min(/Ubiquiti UniFi UAP/unifi.uap.mem,{$UNIFI.MEM.USAGE.WINDOW})>{$UNIFI.MEM.USAGE.WARN} and min(/Ubiquiti UniFi UAP/unifi.uap.mem,{$UNIFI.MEM.USAGE.WINDOW})<={$UNIFI.MEM.USAGE.HIGH}
         name: '{HOST.NAME} memory high: {ITEM.LASTVALUE} (threshold: {$UNIFI.MEM.USAGE.WARN}%)'
         priority: WARNING
-        description: Device memory usage is elevated above the warning threshold ({$UNIFI.MEM.USAGE.WARN}%). Monitor for further increases. A reboot may clear leaked
+        description: Device memory usage has stayed above the warning threshold ({$UNIFI.MEM.USAGE.WARN}%) for at least {$UNIFI.MEM.USAGE.WINDOW}. Monitor for further increases. A reboot may clear leaked
           memory if the issue persists without a clear cause.
     - uuid: 7992b619e57143ee9f2c8e3585a5b37b
       name: Uptime
@@ -7109,12 +7115,18 @@ zabbix_export:
     - macro: '{$UNIFI.CPU.USAGE.HIGH}'
       value: '90'
       description: CPU usage high threshold (%).
+    - macro: '{$UNIFI.CPU.USAGE.WINDOW}'
+      value: 5m
+      description: Time window CPU usage must stay above a threshold before the CPU alarms fire - every sample in the window must exceed it. Rides out the short spikes routine background work produces, which the UniFi dashboard's averaged CPU graph never shows.
     - macro: '{$UNIFI.MEM.USAGE.WARN}'
       value: '80'
       description: Memory usage warning threshold (%).
     - macro: '{$UNIFI.MEM.USAGE.HIGH}'
       value: '90'
       description: Memory usage high threshold (%).
+    - macro: '{$UNIFI.MEM.USAGE.WINDOW}'
+      value: 5m
+      description: Time window memory usage must stay above a threshold before the memory alarms fire - every sample in the window must exceed it. Rides out short bursts, which the UniFi dashboard's averaged memory graph never shows.
     - macro: '{$UNIFI.TEMP.WARN}'
       value: '55'
       description: Temperature warning threshold (°C).
@@ -7147,7 +7159,7 @@ zabbix_export:
       Local controller polling for UniFi Switches. Applied alongside Ubiquiti UniFi Device by host prototype
       discovery.
 
-      Version: 1.8.0
+      Version: 1.8.1
     groups:
     - name: Templates
     items:
@@ -7339,17 +7351,17 @@ zabbix_export:
         value: usw
       triggers:
       - uuid: 676f86772a66452da3333b15b8deb408
-        expression: last(/Ubiquiti UniFi USW/unifi.usw.cpu)>{$UNIFI.CPU.USAGE.HIGH}
+        expression: min(/Ubiquiti UniFi USW/unifi.usw.cpu,{$UNIFI.CPU.USAGE.WINDOW})>{$UNIFI.CPU.USAGE.HIGH}
         name: '{HOST.NAME} CPU critical: {ITEM.LASTVALUE} (threshold: {$UNIFI.CPU.USAGE.HIGH}%)'
         priority: HIGH
-        description: Device CPU has exceeded the critical threshold ({$UNIFI.CPU.USAGE.HIGH}%). At sustained high CPU the device may drop connections, slow 
+        description: Device CPU has stayed above the critical threshold ({$UNIFI.CPU.USAGE.HIGH}%) for at least {$UNIFI.CPU.USAGE.WINDOW}. At sustained high CPU the device may drop connections, slow 
           control-plane processing, or behave erratically. Check for firmware issues or an unusually high load, and 
           consider a reboot if the condition persists.
       - uuid: 40ade489c5dd4bdc82fbafe18e916827
-        expression: last(/Ubiquiti UniFi USW/unifi.usw.cpu)>{$UNIFI.CPU.USAGE.WARN} and last(/Ubiquiti UniFi USW/unifi.usw.cpu)<={$UNIFI.CPU.USAGE.HIGH}
+        expression: min(/Ubiquiti UniFi USW/unifi.usw.cpu,{$UNIFI.CPU.USAGE.WINDOW})>{$UNIFI.CPU.USAGE.WARN} and min(/Ubiquiti UniFi USW/unifi.usw.cpu,{$UNIFI.CPU.USAGE.WINDOW})<={$UNIFI.CPU.USAGE.HIGH}
         name: '{HOST.NAME} CPU high: {ITEM.LASTVALUE} (threshold: {$UNIFI.CPU.USAGE.WARN}%)'
         priority: WARNING
-        description: Device CPU usage is elevated above the warning threshold ({$UNIFI.CPU.USAGE.WARN}%). This is within operational tolerance but should be 
+        description: Device CPU usage has stayed above the warning threshold ({$UNIFI.CPU.USAGE.WARN}%) for at least {$UNIFI.CPU.USAGE.WINDOW}. This is within operational tolerance but should be 
           monitored. Sustained high CPU can indicate heavy traffic, an active RF scan (on APs), or a firmware issue.
     - uuid: 7da3214b8a0344dcb18f6903bfd2daf1
       name: Memory Usage
@@ -7372,16 +7384,16 @@ zabbix_export:
         value: usw
       triggers:
       - uuid: 32b7ddc71c8f445e9258c0e726821857
-        expression: last(/Ubiquiti UniFi USW/unifi.usw.mem)>{$UNIFI.MEM.USAGE.HIGH}
+        expression: min(/Ubiquiti UniFi USW/unifi.usw.mem,{$UNIFI.MEM.USAGE.WINDOW})>{$UNIFI.MEM.USAGE.HIGH}
         name: '{HOST.NAME} memory critical: {ITEM.LASTVALUE} (threshold: {$UNIFI.MEM.USAGE.HIGH}%)'
         priority: HIGH
-        description: Device memory has exceeded the critical threshold ({$UNIFI.MEM.USAGE.HIGH}%). The device may begin dropping new associations or behave 
+        description: Device memory has stayed above the critical threshold ({$UNIFI.MEM.USAGE.HIGH}%) for at least {$UNIFI.MEM.USAGE.WINDOW}. The device may begin dropping new associations or behave 
           erratically. A reboot will typically recover memory; if the issue recurs, check for a firmware memory leak.
       - uuid: d494f87f3d1a42b7a88aa7506c9ebfe7
-        expression: last(/Ubiquiti UniFi USW/unifi.usw.mem)>{$UNIFI.MEM.USAGE.WARN} and last(/Ubiquiti UniFi USW/unifi.usw.mem)<={$UNIFI.MEM.USAGE.HIGH}
+        expression: min(/Ubiquiti UniFi USW/unifi.usw.mem,{$UNIFI.MEM.USAGE.WINDOW})>{$UNIFI.MEM.USAGE.WARN} and min(/Ubiquiti UniFi USW/unifi.usw.mem,{$UNIFI.MEM.USAGE.WINDOW})<={$UNIFI.MEM.USAGE.HIGH}
         name: '{HOST.NAME} memory high: {ITEM.LASTVALUE} (threshold: {$UNIFI.MEM.USAGE.WARN}%)'
         priority: WARNING
-        description: Device memory usage is elevated above the warning threshold ({$UNIFI.MEM.USAGE.WARN}%). Monitor for further increases. A reboot may clear leaked
+        description: Device memory usage has stayed above the warning threshold ({$UNIFI.MEM.USAGE.WARN}%) for at least {$UNIFI.MEM.USAGE.WINDOW}. Monitor for further increases. A reboot may clear leaked
           memory if the issue persists without a clear cause.
     - uuid: 509ba09f0d2c400086ec84bc907b94e7
       name: Uptime
@@ -8517,12 +8529,18 @@ zabbix_export:
     - macro: '{$UNIFI.CPU.USAGE.HIGH}'
       value: '90'
       description: CPU usage high threshold (%).
+    - macro: '{$UNIFI.CPU.USAGE.WINDOW}'
+      value: 5m
+      description: Time window CPU usage must stay above a threshold before the CPU alarms fire - every sample in the window must exceed it. Rides out the short spikes routine background work produces, which the UniFi dashboard's averaged CPU graph never shows.
     - macro: '{$UNIFI.MEM.USAGE.WARN}'
       value: '80'
       description: Memory usage warning threshold (%).
     - macro: '{$UNIFI.MEM.USAGE.HIGH}'
       value: '90'
       description: Memory usage high threshold (%).
+    - macro: '{$UNIFI.MEM.USAGE.WINDOW}'
+      value: 5m
+      description: Time window memory usage must stay above a threshold before the memory alarms fire - every sample in the window must exceed it. Rides out short bursts, which the UniFi dashboard's averaged memory graph never shows.
     - macro: '{$UNIFI.TEMP.WARN}'
       value: '55'
       description: Temperature warning threshold (°C).
@@ -8583,7 +8601,7 @@ zabbix_export:
       Local controller polling for USW-Deployed-24 (USWDA) with battery backup. Applied alongside Ubiquiti
       UniFi Device by host prototype discovery.
 
-      Version: 1.8.0
+      Version: 1.8.1
     groups:
     - name: Templates
     items:
@@ -8775,10 +8793,10 @@ zabbix_export:
         value: ups
       triggers:
       - uuid: 348ae01c975e4ba6af2708644c4a282f
-        expression: last(/Ubiquiti UniFi UPS/unifi.ups.cpu)>{$UNIFI.CPU.USAGE.WARN}
+        expression: min(/Ubiquiti UniFi UPS/unifi.ups.cpu,{$UNIFI.CPU.USAGE.WINDOW})>{$UNIFI.CPU.USAGE.WARN}
         name: '{HOST.NAME} CPU high: {ITEM.LASTVALUE} (threshold: {$UNIFI.CPU.USAGE.WARN}%)'
         priority: WARNING
-        description: Device CPU usage is elevated above the warning threshold ({$UNIFI.CPU.USAGE.WARN}%). This is within operational tolerance but should be 
+        description: Device CPU usage has stayed above the warning threshold ({$UNIFI.CPU.USAGE.WARN}%) for at least {$UNIFI.CPU.USAGE.WINDOW}. This is within operational tolerance but should be 
           monitored. Sustained high CPU can indicate heavy traffic, an active RF scan (on APs), or a firmware issue.
     - uuid: 5e7c0e846d974a5ba70eab24ff805d91
       name: Memory Usage
@@ -8801,10 +8819,10 @@ zabbix_export:
         value: ups
       triggers:
       - uuid: d0a1f3b7c2e94f8ab1cd567890ef1234
-        expression: last(/Ubiquiti UniFi UPS/unifi.ups.mem)>{$UNIFI.MEM.USAGE.WARN}
+        expression: min(/Ubiquiti UniFi UPS/unifi.ups.mem,{$UNIFI.MEM.USAGE.WINDOW})>{$UNIFI.MEM.USAGE.WARN}
         name: '{HOST.NAME} memory high: {ITEM.LASTVALUE} (threshold: {$UNIFI.MEM.USAGE.WARN}%)'
         priority: WARNING
-        description: Device memory usage is elevated above the warning threshold ({$UNIFI.MEM.USAGE.WARN}%). Monitor for further increases. A reboot may clear leaked
+        description: Device memory usage has stayed above the warning threshold ({$UNIFI.MEM.USAGE.WARN}%) for at least {$UNIFI.MEM.USAGE.WINDOW}. Monitor for further increases. A reboot may clear leaked
           memory if the issue persists without a clear cause.
     - uuid: a1b2c3d4e5f64a7b8c9d0e1f2a3b4c5d
       name: Uptime
@@ -9040,12 +9058,18 @@ zabbix_export:
     - macro: '{$UNIFI.CPU.USAGE.HIGH}'
       value: '90'
       description: CPU usage high threshold (%).
+    - macro: '{$UNIFI.CPU.USAGE.WINDOW}'
+      value: 5m
+      description: Time window CPU usage must stay above a threshold before the CPU alarms fire - every sample in the window must exceed it. Rides out the short spikes routine background work produces, which the UniFi dashboard's averaged CPU graph never shows.
     - macro: '{$UNIFI.MEM.USAGE.WARN}'
       value: '80'
       description: Memory usage warning threshold (%).
     - macro: '{$UNIFI.MEM.USAGE.HIGH}'
       value: '90'
       description: Memory usage high threshold (%).
+    - macro: '{$UNIFI.MEM.USAGE.WINDOW}'
+      value: 5m
+      description: Time window memory usage must stay above a threshold before the memory alarms fire - every sample in the window must exceed it. Rides out short bursts, which the UniFi dashboard's averaged memory graph never shows.
     - macro: '{$UNIFI.TEMP.WARN}'
       value: '55'
       description: Temperature warning threshold (°C).
@@ -9087,7 +9111,7 @@ zabbix_export:
       Local controller polling for USP-RPS (Redundant Power Supply). Monitors PSU failover state - DISASTER
       fires when a connected device loses its primary PSU and the RPS takes over.
 
-      Version: 1.8.0
+      Version: 1.8.1
     groups:
     - name: Templates
     items:
@@ -9279,10 +9303,10 @@ zabbix_export:
         value: rps
       triggers:
       - uuid: c368916d0dc3434a9578a3887f7e2d26
-        expression: last(/Ubiquiti UniFi RPS/unifi.rps.cpu)>{$UNIFI.CPU.USAGE.WARN}
+        expression: min(/Ubiquiti UniFi RPS/unifi.rps.cpu,{$UNIFI.CPU.USAGE.WINDOW})>{$UNIFI.CPU.USAGE.WARN}
         name: '{HOST.NAME} CPU high: {ITEM.LASTVALUE} (threshold: {$UNIFI.CPU.USAGE.WARN}%)'
         priority: WARNING
-        description: Device CPU usage is elevated above the warning threshold ({$UNIFI.CPU.USAGE.WARN}%). This is within operational tolerance but should be 
+        description: Device CPU usage has stayed above the warning threshold ({$UNIFI.CPU.USAGE.WARN}%) for at least {$UNIFI.CPU.USAGE.WINDOW}. This is within operational tolerance but should be 
           monitored. Sustained high CPU can indicate heavy traffic, an active RF scan (on APs), or a firmware issue.
     - uuid: 99459c42bec14b3489e94faafdacb18b
       name: Memory Usage
@@ -9305,10 +9329,10 @@ zabbix_export:
         value: rps
       triggers:
       - uuid: c1d2e3f4a5b64c7d8e9f0a1b2c3d4e5f
-        expression: last(/Ubiquiti UniFi RPS/unifi.rps.mem)>{$UNIFI.MEM.USAGE.WARN}
+        expression: min(/Ubiquiti UniFi RPS/unifi.rps.mem,{$UNIFI.MEM.USAGE.WINDOW})>{$UNIFI.MEM.USAGE.WARN}
         name: '{HOST.NAME} memory high: {ITEM.LASTVALUE} (threshold: {$UNIFI.MEM.USAGE.WARN}%)'
         priority: WARNING
-        description: Device memory usage is elevated above the warning threshold ({$UNIFI.MEM.USAGE.WARN}%). Monitor for further increases. A reboot may clear leaked
+        description: Device memory usage has stayed above the warning threshold ({$UNIFI.MEM.USAGE.WARN}%) for at least {$UNIFI.MEM.USAGE.WINDOW}. Monitor for further increases. A reboot may clear leaked
           memory if the issue persists without a clear cause.
     - uuid: d2e3f4a5b6c74d8e9f0a1b2c3d4e5f6a
       name: Uptime
@@ -9700,12 +9724,18 @@ zabbix_export:
     - macro: '{$UNIFI.CPU.USAGE.HIGH}'
       value: '90'
       description: CPU usage high threshold (%).
+    - macro: '{$UNIFI.CPU.USAGE.WINDOW}'
+      value: 5m
+      description: Time window CPU usage must stay above a threshold before the CPU alarms fire - every sample in the window must exceed it. Rides out the short spikes routine background work produces, which the UniFi dashboard's averaged CPU graph never shows.
     - macro: '{$UNIFI.MEM.USAGE.WARN}'
       value: '80'
       description: Memory usage warning threshold (%).
     - macro: '{$UNIFI.MEM.USAGE.HIGH}'
       value: '90'
       description: Memory usage high threshold (%).
+    - macro: '{$UNIFI.MEM.USAGE.WINDOW}'
+      value: 5m
+      description: Time window memory usage must stay above a threshold before the memory alarms fire - every sample in the window must exceed it. Rides out short bursts, which the UniFi dashboard's averaged memory graph never shows.
     - macro: '{$UNIFI.TEMP.WARN}'
       value: '55'
       description: Temperature warning threshold (°C).
@@ -9748,7 +9778,7 @@ zabbix_export:
       Protect Cameras" on Ubiquiti UniFi API Host. Reuses the same session token already cached by that console's
       unifi.host.session item - no separate login or credentials of its own.
 
-      Version: 1.8.0
+      Version: 1.8.1
     groups:
     - name: Templates
     items:
@@ -10211,7 +10241,7 @@ zabbix_export:
       types have no recording concept. Reuses the same session token already cached by that console's
       unifi.host.session item - no separate login or credentials of its own.
 
-      Version: 1.8.0
+      Version: 1.8.1
     groups:
     - name: Templates
     items:
